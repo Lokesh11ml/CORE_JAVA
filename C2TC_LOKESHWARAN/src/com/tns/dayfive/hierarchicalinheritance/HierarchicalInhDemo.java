@@ -19,5 +19,5 @@ public class HierarchicalInhDemo {
 		System.out.println("Student Details "+p); 
 		} 
 
-	}
+	}	
 
