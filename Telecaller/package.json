@@ -1,0 +1,21 @@
+{
+  "name": "telecaller-app",
+  "version": "1.0.0",
+  "description": "Centralized telecaller app for staff management, Meta ads integration, and call tracking",
+  "main": "Backend/index.js",
+  "scripts": {
+    "dev": "concurrently \"npm run server\" \"npm run client\"",
+    "server": "cd Backend && nodemon index.js",
+    "client": "cd Frontend && npm start",
+    "build": "cd Frontend && npm run build",
+    "install-all": "npm install && cd Backend && npm install && cd ../Frontend && npm install",
+    "seed": "cd Backend && node scripts/seedDatabase.js",
+    "start": "cd Backend && node index.js"
+  },
+  "keywords": ["telecaller", "crm", "meta-ads", "call-tracking"],
+  "author": "Your Team",
+  "license": "MIT",
+  "devDependencies": {
+    "concurrently": "^7.6.0"
+  }
+}
