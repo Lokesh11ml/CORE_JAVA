@@ -8,7 +8,7 @@ const seedUsers = [
     email: 'admin@telecaller.com',
     password: 'admin123',
     role: 'admin',
-    department: 'management',
+    department: 'sales',
     phone: '9999999999',
     isActive: true,
     currentStatus: 'available'
