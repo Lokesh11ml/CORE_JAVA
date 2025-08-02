@@ -2,23 +2,23 @@ const express = require('express');
 const { body, validationResult, query } = require('express-validator');
 const Report = require('../models/Report');
 const User = require('../models/User');
-const Lead = require('../models/Lead');
-const Call = require('../models/Call');
-const XLSX = require('xlsx');
-const PDFDocument = require('pdfkit');
-const { verifyToken, requireSupervisor } = require('../middleware/auth');
+const { verifyToken, requireRole } = require('../middleware/auth');
+const reportService = require('../services/reportService');
 
 const router = express.Router();
 
 // @route   GET /api/reports
-// @desc    Get reports with filtering and pagination
+// @desc    Get all reports with filtering and pagination
 // @access  Private
 router.get('/', [
   verifyToken,
   query('page').optional().isInt({ min: 1 }).withMessage('Page must be a positive integer'),
   query('limit').optional().isInt({ min: 1, max: 100 }).withMessage('Limit must be between 1 and 100'),
-  query('reportType').optional().isIn(['daily', 'weekly', 'monthly', 'custom']),
-  query('status').optional().isIn(['draft', 'submitted', 'reviewed', 'approved'])
+  query('status').optional().isIn(['draft', 'submitted', 'reviewed', 'approved', 'rejected']).withMessage('Invalid status'),
+  query('reportType').optional().isIn(['daily', 'weekly', 'monthly']).withMessage('Invalid report type'),
+  query('user').optional().isMongoId().withMessage('Invalid user ID'),
+  query('dateFrom').optional().isISO8601().withMessage('Invalid dateFrom format'),
+  query('dateTo').optional().isISO8601().withMessage('Invalid dateTo format')
 ], async (req, res) => {
   try {
     const errors = validationResult(req);
@@ -28,114 +28,90 @@ router.get('/', [
 
     const {
       page = 1,
-      limit = 20,
-      reportType,
+      limit = 10,
       status,
-      userId,
-      startDate,
-      endDate,
-      sortBy = 'reportDate',
-      sortOrder = 'desc'
+      reportType,
+      user,
+      dateFrom,
+      dateTo
     } = req.query;
 
-    // Build filter object
-    const filter = {};
+    // Build query
+    const query = {};
 
     // Role-based filtering
     if (req.user.role === 'telecaller') {
-      filter.userId = req.user._id;
+      query.user = req.user._id;
     } else if (req.user.role === 'supervisor') {
       // Supervisor can see their team's reports
-      const teamMemberIds = [...req.user.teamMembers, req.user._id];
-      filter.userId = { $in: teamMemberIds };
+      const teamMemberIds = req.user.teamMembers.map(member => member._id);
+      query.user = { $in: teamMemberIds };
     }
-    // Admin can see all reports (no additional filter)
 
-    // Apply query filters
-    if (reportType) filter.reportType = reportType;
-    if (status) filter.status = status;
-    if (userId && (req.user.role === 'admin' || req.user.role === 'supervisor')) {
-      filter.userId = userId;
-    }
+    // Apply filters
+    if (status) query.status = status;
+    if (reportType) query.reportType = reportType;
+    if (user) query.user = user;
 
     // Date range filter
-    if (startDate || endDate) {
-      filter.reportDate = {};
-      if (startDate) filter.reportDate.$gte = new Date(startDate);
-      if (endDate) filter.reportDate.$lte = new Date(endDate);
+    if (dateFrom || dateTo) {
+      query.reportDate = {};
+      if (dateFrom) query.reportDate.$gte = new Date(dateFrom);
+      if (dateTo) query.reportDate.$lte = new Date(dateTo);
     }
 
-    // Pagination
-    const skip = (page - 1) * limit;
-    const sortObj = { [sortBy]: sortOrder === 'desc' ? -1 : 1 };
+    // Calculate pagination
+    const skip = (parseInt(page) - 1) * parseInt(limit);
 
-    // Execute query
-    const reports = await Report.find(filter)
-      .populate('userId', 'name email role department')
-      .populate('supervisorReview.reviewedBy', 'name email')
-      .sort(sortObj)
+    // Get reports with population
+    const reports = await Report.find(query)
+      .populate('user', 'name email role')
+      .populate('reviewedBy', 'name email')
+      .sort({ reportDate: -1 })
       .skip(skip)
       .limit(parseInt(limit));
 
-    const total = await Report.countDocuments(filter);
+    // Get total count
+    const total = await Report.countDocuments(query);
+
+    // Calculate pagination info
+    const pages = Math.ceil(total / parseInt(limit));
 
     res.json({
+      success: true,
       reports,
       pagination: {
         page: parseInt(page),
         limit: parseInt(limit),
         total,
-        pages: Math.ceil(total / limit)
+        pages
       }
     });
 
   } catch (error) {
     console.error('Get reports error:', error);
-    res.status(500).json({ message: 'Server error fetching reports' });
-  }
-});
-
-// @route   GET /api/reports/:id
-// @desc    Get single report by ID
-// @access  Private
-router.get('/:id', verifyToken, async (req, res) => {
-  try {
-    const report = await Report.findById(req.params.id)
-      .populate('userId', 'name email role department phone')
-      .populate('supervisorReview.reviewedBy', 'name email');
-
-    if (!report) {
-      return res.status(404).json({ message: 'Report not found' });
-    }
-
-    // Check access permissions
-    const canAccess = req.user.role === 'admin' ||
-                     (req.user.role === 'supervisor' && req.user.teamMembers.includes(report.userId._id)) ||
-                     (req.user.role === 'telecaller' && report.userId._id.toString() === req.user._id.toString());
-
-    if (!canAccess) {
-      return res.status(403).json({ message: 'Access denied to this report' });
-    }
-
-    res.json({ report });
-
-  } catch (error) {
-    console.error('Get report error:', error);
-    res.status(500).json({ message: 'Server error fetching report' });
+    res.status(500).json({ message: 'Server error' });
   }
 });
 
 // @route   POST /api/reports
-// @desc    Create or update daily report
+// @desc    Create a new report
 // @access  Private
 router.post('/', [
   verifyToken,
-  body('reportDate').isISO8601().withMessage('Valid report date is required'),
-  body('reportType').isIn(['daily', 'weekly', 'monthly', 'custom']).withMessage('Invalid report type'),
-  body('callMetrics.totalCalls').optional().isInt({ min: 0 }),
-  body('callMetrics.completedCalls').optional().isInt({ min: 0 }),
-  body('leadMetrics.newLeads').optional().isInt({ min: 0 }),
-  body('leadMetrics.convertedLeads').optional().isInt({ min: 0 })
+  body('reportType').isIn(['daily', 'weekly', 'monthly']).withMessage('Invalid report type'),
+  body('reportDate').isISO8601().withMessage('Invalid report date'),
+  body('totalCalls').optional().isInt({ min: 0 }).withMessage('Total calls must be a non-negative integer'),
+  body('completedCalls').optional().isInt({ min: 0 }).withMessage('Completed calls must be a non-negative integer'),
+  body('successfulCalls').optional().isInt({ min: 0 }).withMessage('Successful calls must be a non-negative integer'),
+  body('contactedLeads').optional().isInt({ min: 0 }).withMessage('Contacted leads must be a non-negative integer'),
+  body('convertedLeads').optional().isInt({ min: 0 }).withMessage('Converted leads must be a non-negative integer'),
+  body('notes').optional().isString().withMessage('Notes must be a string'),
+  body('challenges').optional().isString().withMessage('Challenges must be a string'),
+  body('improvements').optional().isString().withMessage('Improvements must be a string'),
+  body('blockers').optional().isString().withMessage('Blockers must be a string'),
+  body('mood').optional().isIn(['excellent', 'good', 'average', 'poor', 'terrible']).withMessage('Invalid mood'),
+  body('energy').optional().isInt({ min: 1, max: 10 }).withMessage('Energy must be between 1 and 10')
 ], async (req, res) => {
   try {
     const errors = validationResult(req);
@@ -143,47 +119,102 @@ router.post('/', [
       return res.status(400).json({ errors: errors.array() });
     }
 
-    const reportData = {
-      ...req.body,
-      userId: req.user._id
-    };
+    const {
+      reportType,
+      reportDate,
+      totalCalls = 0,
+      completedCalls = 0,
+      successfulCalls = 0,
+      contactedLeads = 0,
+      convertedLeads = 0,
+      notes,
+      challenges,
+      improvements,
+      blockers,
+      mood = 'good',
+      energy = 7,
+      activities = []
+    } = req.body;
 
-    const reportDate = new Date(reportData.reportDate);
-    reportDate.setHours(0, 0, 0, 0);
-
-    // Check if report already exists for this date
+    // Check if report already exists for this date and user
     const existingReport = await Report.findOne({
-      userId: req.user._id,
-      reportDate: reportDate
+      user: req.user._id,
+      reportDate: new Date(reportDate),
+      reportType
     });
 
-    let report;
     if (existingReport) {
-      // Update existing report if it's still editable
-      if (!existingReport.isEditable()) {
-        return res.status(400).json({ message: 'Report has been submitted and cannot be modified' });
-      }
-
-      Object.assign(existingReport, reportData);
-      report = await existingReport.save();
-    } else {
-      // Create new report
-      reportData.reportDate = reportDate;
-      report = new Report(reportData);
-      await report.save();
+      return res.status(400).json({ 
+        message: 'Report already exists for this date' 
+      });
     }
 
-    const populatedReport = await Report.findById(report._id)
-      .populate('userId', 'name email role department');
+    // Create new report
+    const report = new Report({
+      user: req.user._id,
+      reportType,
+      reportDate: new Date(reportDate),
+      totalCalls,
+      completedCalls,
+      successfulCalls,
+      contactedLeads,
+      convertedLeads,
+      notes,
+      challenges,
+      improvements,
+      blockers,
+      mood,
+      energy,
+      activities,
+      status: 'draft'
+    });
 
-    res.status(existingReport ? 200 : 201).json({
-      message: existingReport ? 'Report updated successfully' : 'Report created successfully',
-      report: populatedReport
+    await report.save();
+
+    // Populate user
+    await report.populate('user', 'name email role');
+
+    res.status(201).json({
+      success: true,
+      message: 'Report created successfully',
+      report
     });
 
   } catch (error) {
-    console.error('Create/Update report error:', error);
-    res.status(500).json({ message: 'Server error creating/updating report' });
+    console.error('Create report error:', error);
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// @route   GET /api/reports/:id
+// @desc    Get specific report
+// @access  Private
+router.get('/:id', [
+  verifyToken,
+  body('id').isMongoId().withMessage('Invalid report ID')
+], async (req, res) => {
+  try {
+    const report = await Report.findById(req.params.id)
+      .populate('user', 'name email role')
+      .populate('reviewedBy', 'name email');
+
+    if (!report) {
+      return res.status(404).json({ message: 'Report not found' });
+    }
+
+    // Check access permissions
+    if (req.user.role === 'telecaller' && report.user._id.toString() !== req.user._id.toString()) {
+      return res.status(403).json({ message: 'Access denied' });
+    }
+
+    res.json({
+      success: true,
+      report
+    });
+
+  } catch (error) {
+    console.error('Get report error:', error);
+    res.status(500).json({ message: 'Server error' });
   }
 });
 
@@ -192,7 +223,17 @@ router.post('/', [
 // @access  Private
 router.put('/:id', [
   verifyToken,
-  body('status').optional().isIn(['draft', 'submitted', 'reviewed', 'approved'])
+  body('totalCalls').optional().isInt({ min: 0 }).withMessage('Total calls must be a non-negative integer'),
+  body('completedCalls').optional().isInt({ min: 0 }).withMessage('Completed calls must be a non-negative integer'),
+  body('successfulCalls').optional().isInt({ min: 0 }).withMessage('Successful calls must be a non-negative integer'),
+  body('contactedLeads').optional().isInt({ min: 0 }).withMessage('Contacted leads must be a non-negative integer'),
+  body('convertedLeads').optional().isInt({ min: 0 }).withMessage('Converted leads must be a non-negative integer'),
+  body('notes').optional().isString().withMessage('Notes must be a string'),
+  body('challenges').optional().isString().withMessage('Challenges must be a string'),
+  body('improvements').optional().isString().withMessage('Improvements must be a string'),
+  body('blockers').optional().isString().withMessage('Blockers must be a string'),
+  body('mood').optional().isIn(['excellent', 'good', 'average', 'poor', 'terrible']).withMessage('Invalid mood'),
+  body('energy').optional().isInt({ min: 1, max: 10 }).withMessage('Energy must be between 1 and 10')
 ], async (req, res) => {
   try {
     const errors = validationResult(req);
@@ -206,81 +247,79 @@ router.put('/:id', [
     }
 
     // Check access permissions
-    const canUpdate = req.user.role === 'admin' ||
-                     (req.user.role === 'supervisor' && req.user.teamMembers.includes(report.userId)) ||
-                     (req.user.role === 'telecaller' && report.userId.toString() === req.user._id.toString());
-
-    if (!canUpdate) {
-      return res.status(403).json({ message: 'Access denied to update this report' });
+    if (req.user.role === 'telecaller' && report.user.toString() !== req.user._id.toString()) {
+      return res.status(403).json({ message: 'Access denied' });
     }
 
-    // Telecallers can only edit draft reports
-    if (req.user.role === 'telecaller' && !report.isEditable()) {
-      return res.status(400).json({ message: 'Report has been submitted and cannot be modified' });
+    // Only allow updates if report is in draft status
+    if (report.status !== 'draft') {
+      return res.status(400).json({ message: 'Can only update draft reports' });
     }
 
     // Update report
-    Object.assign(report, req.body);
-    await report.save();
-
-    const updatedReport = await Report.findById(report._id)
-      .populate('userId', 'name email role department')
-      .populate('supervisorReview.reviewedBy', 'name email');
+    const updatedReport = await Report.findByIdAndUpdate(
+      req.params.id,
+      req.body,
+      { new: true, runValidators: true }
+    ).populate('user', 'name email role');
 
     res.json({
+      success: true,
       message: 'Report updated successfully',
       report: updatedReport
     });
 
   } catch (error) {
     console.error('Update report error:', error);
-    res.status(500).json({ message: 'Server error updating report' });
+    res.status(500).json({ message: 'Server error' });
   }
 });
 
-// @route   PUT /api/reports/:id/submit
+// @route   POST /api/reports/:id/submit
 // @desc    Submit report for review
 // @access  Private
-router.put('/:id/submit', verifyToken, async (req, res) => {
+router.post('/:id/submit', verifyToken, async (req, res) => {
   try {
     const report = await Report.findById(req.params.id);
     if (!report) {
       return res.status(404).json({ message: 'Report not found' });
     }
 
-    // Only the report owner can submit
-    if (report.userId.toString() !== req.user._id.toString()) {
-      return res.status(403).json({ message: 'Only the report owner can submit it' });
+    // Check access permissions
+    if (req.user.role === 'telecaller' && report.user.toString() !== req.user._id.toString()) {
+      return res.status(403).json({ message: 'Access denied' });
     }
 
+    // Only allow submission if report is in draft status
     if (report.status !== 'draft') {
-      return res.status(400).json({ message: 'Only draft reports can be submitted' });
+      return res.status(400).json({ message: 'Report is not in draft status' });
     }
 
+    // Update report status
     report.status = 'submitted';
-    report.submittedAt = new Date();
     await report.save();
 
     res.json({
+      success: true,
       message: 'Report submitted successfully',
       report
     });
 
   } catch (error) {
     console.error('Submit report error:', error);
-    res.status(500).json({ message: 'Server error submitting report' });
+    res.status(500).json({ message: 'Server error' });
   }
 });
 
-// @route   PUT /api/reports/:id/review
+// @route   POST /api/reports/:id/review
 // @desc    Review report (Supervisor/Admin)
 // @access  Private (Supervisor/Admin)
-router.put('/:id/review', [
+router.post('/:id/review', [
   verifyToken,
-  requireSupervisor,
-  body('rating').isInt({ min: 1, max: 5 }).withMessage('Rating must be between 1 and 5'),
-  body('feedback').optional().isLength({ max: 1000 }).withMessage('Feedback cannot exceed 1000 characters'),
-  body('status').isIn(['reviewed', 'approved']).withMessage('Status must be reviewed or approved')
+  requireRole('admin', 'supervisor'),
+  body('status').isIn(['approved', 'rejected']).withMessage('Invalid review status'),
+  body('reviewNotes').optional().isString().withMessage('Review notes must be a string'),
+  body('reviewRating').optional().isInt({ min: 1, max: 5 }).withMessage('Review rating must be between 1 and 5')
 ], async (req, res) => {
   try {
     const errors = validationResult(req);
@@ -288,212 +327,174 @@ router.put('/:id/review', [
       return res.status(400).json({ errors: errors.array() });
     }
 
-    const { rating, feedback, recommendations, status } = req.body;
+    const { status, reviewNotes, reviewRating } = req.body;
 
     const report = await Report.findById(req.params.id);
     if (!report) {
       return res.status(404).json({ message: 'Report not found' });
     }
 
-    if (report.status !== 'submitted') {
-      return res.status(400).json({ message: 'Only submitted reports can be reviewed' });
+    // Check if supervisor is reviewing their team member's report
+    if (req.user.role === 'supervisor') {
+      const isTeamMember = req.user.teamMembers.includes(report.user);
+      if (!isTeamMember) {
+        return res.status(403).json({ message: 'Can only review team member reports' });
+      }
     }
 
     // Update report with review
-    report.supervisorReview = {
-      reviewedBy: req.user._id,
-      reviewDate: new Date(),
-      rating,
-      feedback,
-      recommendations
-    };
     report.status = status;
+    report.reviewedBy = req.user._id;
+    report.reviewDate = new Date();
+    if (reviewNotes) report.reviewNotes = reviewNotes;
+    if (reviewRating) report.reviewRating = reviewRating;
 
     await report.save();
 
-    const updatedReport = await Report.findById(report._id)
-      .populate('userId', 'name email role department')
-      .populate('supervisorReview.reviewedBy', 'name email');
+    await report.populate('user', 'name email role');
+    await report.populate('reviewedBy', 'name email');
 
     res.json({
+      success: true,
       message: 'Report reviewed successfully',
-      report: updatedReport
+      report
     });
 
   } catch (error) {
     console.error('Review report error:', error);
-    res.status(500).json({ message: 'Server error reviewing report' });
+    res.status(500).json({ message: 'Server error' });
   }
 });
 
-// @route   GET /api/reports/my/today
-// @desc    Get or create today's report for current user
+// @route   GET /api/reports/user/:userId
+// @desc    Get reports for specific user
 // @access  Private
-router.get('/my/today', verifyToken, async (req, res) => {
+router.get('/user/:userId', [
+  verifyToken,
+  query('status').optional().isIn(['draft', 'submitted', 'reviewed', 'approved', 'rejected']).withMessage('Invalid status'),
+  query('reportType').optional().isIn(['daily', 'weekly', 'monthly']).withMessage('Invalid report type'),
+  query('dateFrom').optional().isISO8601().withMessage('Invalid dateFrom format'),
+  query('dateTo').optional().isISO8601().withMessage('Invalid dateTo format')
+], async (req, res) => {
   try {
-    const today = new Date();
-    today.setHours(0, 0, 0, 0);
+    const { status, reportType, dateFrom, dateTo } = req.query;
+    const { userId } = req.params;
 
-    let report = await Report.findOne({
-      userId: req.user._id,
-      reportDate: today
-    }).populate('userId', 'name email role department');
-
-    if (!report) {
-      // Generate report from actual data
-      const tomorrow = new Date(today);
-      tomorrow.setDate(tomorrow.getDate() + 1);
-
-      // Get call metrics
-      const callStats = await Call.aggregate([
-        {
-          $match: {
-            telecallerId: req.user._id,
-            createdAt: { $gte: today, $lt: tomorrow }
-          }
-        },
-        {
-          $group: {
-            _id: null,
-            totalCalls: { $sum: 1 },
-            completedCalls: { $sum: { $cond: [{ $eq: ['$status', 'completed'] }, 1, 0] } },
-            missedCalls: { $sum: { $cond: [{ $eq: ['$status', 'missed'] }, 1, 0] } },
-            successfulCalls: { $sum: { $cond: ['$isSuccessful', 1, 0] } },
-            totalCallDuration: { $sum: '$duration' }
-          }
-        }
-      ]);
-
-      // Get lead metrics
-      const leadStats = await Lead.aggregate([
-        {
-          $match: {
-            assignedTo: req.user._id,
-            createdAt: { $gte: today, $lt: tomorrow }
-          }
-        },
-        {
-          $group: {
-            _id: null,
-            newLeads: { $sum: 1 },
-            contactedLeads: { $sum: { $cond: [{ $ne: ['$lastContactDate', null] }, 1, 0] } },
-            qualifiedLeads: { $sum: { $cond: [{ $eq: ['$status', 'qualified'] }, 1, 0] } },
-            interestedLeads: { $sum: { $cond: [{ $eq: ['$status', 'interested'] }, 1, 0] } },
-            convertedLeads: { $sum: { $cond: [{ $eq: ['$status', 'converted'] }, 1, 0] } }
-          }
-        }
-      ]);
-
-      const callMetrics = callStats[0] || {
-        totalCalls: 0,
-        completedCalls: 0,
-        missedCalls: 0,
-        successfulCalls: 0,
-        totalCallDuration: 0
-      };
-
-      const leadMetrics = leadStats[0] || {
-        newLeads: 0,
-        contactedLeads: 0,
-        qualifiedLeads: 0,
-        interestedLeads: 0,
-        convertedLeads: 0
-      };
-
-      // Create new report with auto-generated data
-      report = new Report({
-        userId: req.user._id,
-        reportDate: today,
-        reportType: 'daily',
-        callMetrics,
-        leadMetrics,
-        status: 'draft'
-      });
-
-      await report.save();
-      report = await Report.findById(report._id).populate('userId', 'name email role department');
+    // Check access permissions
+    if (req.user.role === 'telecaller' && userId !== req.user._id.toString()) {
+      return res.status(403).json({ message: 'Access denied' });
     }
 
-    res.json({ report });
+    const query = { user: userId };
+    if (status) query.status = status;
+    if (reportType) query.reportType = reportType;
 
-  } catch (error) {
-    console.error('Get today report error:', error);
-    res.status(500).json({ message: 'Server error fetching today\'s report' });
-  }
-});
-
-// @route   GET /api/reports/analytics/team
-// @desc    Get team analytics
-// @access  Private (Supervisor/Admin)
-router.get('/analytics/team', [verifyToken, requireSupervisor], async (req, res) => {
-  try {
-    const { startDate, endDate } = req.query;
-    
-    let teamMemberIds = [];
-    if (req.user.role === 'supervisor') {
-      teamMemberIds = req.user.teamMembers;
-    } else if (req.user.role === 'admin') {
-      const allTelecallers = await User.find({ role: 'telecaller' }, '_id');
-      teamMemberIds = allTelecallers.map(t => t._id);
+    // Date range filter
+    if (dateFrom || dateTo) {
+      query.reportDate = {};
+      if (dateFrom) query.reportDate.$gte = new Date(dateFrom);
+      if (dateTo) query.reportDate.$lte = new Date(dateTo);
     }
 
-    const start = startDate ? new Date(startDate) : new Date(Date.now() - 30 * 24 * 60 * 60 * 1000);
-    const end = endDate ? new Date(endDate) : new Date();
-
-    // Get team report analytics
-    const teamStats = await Report.generateTeamReport(teamMemberIds, start, end);
-
-    // Get individual member performance
-    const memberPerformance = await Report.aggregate([
-      {
-        $match: {
-          userId: { $in: teamMemberIds },
-          reportDate: { $gte: start, $lte: end },
-          status: { $in: ['submitted', 'reviewed', 'approved'] }
-        }
-      },
-      {
-        $lookup: {
-          from: 'users',
-          localField: 'userId',
-          foreignField: '_id',
-          as: 'user'
-        }
-      },
-      { $unwind: '$user' },
-      {
-        $group: {
-          _id: '$userId',
-          name: { $first: '$user.name' },
-          email: { $first: '$user.email' },
-          totalReports: { $sum: 1 },
-          avgCalls: { $avg: '$callMetrics.totalCalls' },
-          avgLeads: { $avg: '$leadMetrics.newLeads' },
-          avgConversions: { $avg: '$leadMetrics.convertedLeads' },
-          avgRating: { $avg: '$supervisorReview.rating' }
-        }
-      },
-      { $sort: { avgRating: -1 } }
-    ]);
+    const reports = await Report.find(query)
+      .populate('user', 'name email role')
+      .populate('reviewedBy', 'name email')
+      .sort({ reportDate: -1 });
 
     res.json({
-      period: { start, end },
-      teamStats,
-      memberPerformance
+      success: true,
+      reports
     });
 
   } catch (error) {
-    console.error('Team analytics error:', error);
-    res.status(500).json({ message: 'Server error fetching team analytics' });
+    console.error('Get user reports error:', error);
+    res.status(500).json({ message: 'Server error' });
   }
 });
 
-// @route   GET /api/reports/:id/export
-// @desc    Export report as Excel or PDF
+// @route   GET /api/reports/stats/overview
+// @desc    Get report statistics overview
 // @access  Private
-router.get('/:id/export', [
+router.get('/stats/overview', verifyToken, async (req, res) => {
+  try {
+    const query = {};
+
+    // Role-based filtering
+    if (req.user.role === 'telecaller') {
+      query.user = req.user._id;
+    } else if (req.user.role === 'supervisor') {
+      const teamMemberIds = req.user.teamMembers.map(member => member._id);
+      query.user = { $in: teamMemberIds };
+    }
+
+    const stats = await Report.aggregate([
+      { $match: query },
+      {
+        $group: {
+          _id: null,
+          totalReports: { $sum: 1 },
+          submittedReports: { $sum: { $cond: [{ $eq: ['$status', 'submitted'] }, 1, 0] } },
+          approvedReports: { $sum: { $cond: [{ $eq: ['$status', 'approved'] }, 1, 0] } },
+          rejectedReports: { $sum: { $cond: [{ $eq: ['$status', 'rejected'] }, 1, 0] } },
+          totalCalls: { $sum: '$totalCalls' },
+          totalLeads: { $sum: '$contactedLeads' },
+          totalConversions: { $sum: '$convertedLeads' },
+          avgEnergy: { $avg: '$energy' },
+          avgMood: {
+            $avg: {
+              $switch: {
+                branches: [
+                  { case: { $eq: ['$mood', 'excellent'] }, then: 5 },
+                  { case: { $eq: ['$mood', 'good'] }, then: 4 },
+                  { case: { $eq: ['$mood', 'average'] }, then: 3 },
+                  { case: { $eq: ['$mood', 'poor'] }, then: 2 },
+                  { case: { $eq: ['$mood', 'terrible'] }, then: 1 }
+                ],
+                default: 3
+              }
+            }
+          }
+        }
+      }
+    ]);
+
+    const overview = stats[0] || {
+      totalReports: 0,
+      submittedReports: 0,
+      approvedReports: 0,
+      rejectedReports: 0,
+      totalCalls: 0,
+      totalLeads: 0,
+      totalConversions: 0,
+      avgEnergy: 0,
+      avgMood: 0
+    };
+
+    // Calculate rates
+    overview.submissionRate = overview.totalReports > 0 ? 
+      Math.round((overview.submittedReports / overview.totalReports) * 100) : 0;
+    overview.approvalRate = overview.submittedReports > 0 ? 
+      Math.round((overview.approvedReports / overview.submittedReports) * 100) : 0;
+
+    res.json({
+      success: true,
+      overview
+    });
+
+  } catch (error) {
+    console.error('Get report stats error:', error);
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// @route   POST /api/reports/generate/:type
+// @desc    Generate Excel/PDF report
+// @access  Private
+router.post('/generate/:type', [
   verifyToken,
-  query('format').isIn(['excel', 'pdf']).withMessage('Format must be excel or pdf')
+  body('reportType').isIn(['leads', 'calls', 'performance', 'meta_ads']).withMessage('Invalid report type'),
+  body('format').isIn(['excel', 'pdf']).withMessage('Invalid format'),
+  body('filters').optional().isObject().withMessage('Filters must be an object')
 ], async (req, res) => {
   try {
     const errors = validationResult(req);
@@ -501,133 +502,64 @@ router.get('/:id/export', [
       return res.status(400).json({ errors: errors.array() });
     }
 
-    const { format } = req.query;
-    
-    const report = await Report.findById(req.params.id)
-      .populate('userId', 'name email role department phone');
+    const { reportType, format, filters = {} } = req.body;
+    const { type } = req.params; // 'excel' or 'pdf'
 
-    if (!report) {
-      return res.status(404).json({ message: 'Report not found' });
+    let result;
+    if (type === 'excel') {
+      result = await reportService.generateExcelReport(reportType, filters, req.user._id);
+    } else if (type === 'pdf') {
+      result = await reportService.generatePDFReport(reportType, filters, req.user._id);
+    } else {
+      return res.status(400).json({ message: 'Invalid report type' });
     }
 
-    // Check access permissions
-    const canAccess = req.user.role === 'admin' ||
-                     (req.user.role === 'supervisor' && req.user.teamMembers.includes(report.userId._id)) ||
-                     (req.user.role === 'telecaller' && report.userId._id.toString() === req.user._id.toString());
-
-    if (!canAccess) {
-      return res.status(403).json({ message: 'Access denied to export this report' });
-    }
-
-    if (format === 'excel') {
-      // Generate Excel file
-      const workbook = XLSX.utils.book_new();
-      
-      const reportData = [
-        ['Report Details'],
-        ['User', report.userId.name],
-        ['Email', report.userId.email],
-        ['Department', report.userId.department],
-        ['Report Date', report.reportDate.toDateString()],
-        ['Report Type', report.reportType],
-        ['Status', report.status],
-        [],
-        ['Call Metrics'],
-        ['Total Calls', report.callMetrics.totalCalls],
-        ['Completed Calls', report.callMetrics.completedCalls],
-        ['Missed Calls', report.callMetrics.missedCalls],
-        ['Successful Calls', report.callMetrics.successfulCalls],
-        ['Total Duration (seconds)', report.callMetrics.totalCallDuration],
-        [],
-        ['Lead Metrics'],
-        ['New Leads', report.leadMetrics.newLeads],
-        ['Contacted Leads', report.leadMetrics.contactedLeads],
-        ['Qualified Leads', report.leadMetrics.qualifiedLeads],
-        ['Interested Leads', report.leadMetrics.interestedLeads],
-        ['Converted Leads', report.leadMetrics.convertedLeads],
-        [],
-        ['Performance Metrics'],
-        ['Connection Rate (%)', report.performanceMetrics.connectionRate],
-        ['Conversion Rate (%)', report.performanceMetrics.conversionRate],
-        ['Customer Satisfaction', report.performanceMetrics.customerSatisfactionAvg]
-      ];
-
-      const worksheet = XLSX.utils.aoa_to_sheet(reportData);
-      XLSX.utils.book_append_sheet(workbook, worksheet, 'Report');
-
-      const buffer = XLSX.write(workbook, { type: 'buffer', bookType: 'xlsx' });
-      
-      res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
-      res.setHeader('Content-Disposition', `attachment; filename="report-${report._id}.xlsx"`);
-      res.send(buffer);
-
-    } else if (format === 'pdf') {
-      // Generate PDF file
-      const doc = new PDFDocument();
-      
-      res.setHeader('Content-Type', 'application/pdf');
-      res.setHeader('Content-Disposition', `attachment; filename="report-${report._id}.pdf"`);
-      
-      doc.pipe(res);
-
-      // PDF content
-      doc.fontSize(20).text('Daily Report', { align: 'center' });
-      doc.moveDown();
-
-      doc.fontSize(14).text(`User: ${report.userId.name}`);
-      doc.text(`Email: ${report.userId.email}`);
-      doc.text(`Department: ${report.userId.department}`);
-      doc.text(`Report Date: ${report.reportDate.toDateString()}`);
-      doc.text(`Status: ${report.status}`);
-      doc.moveDown();
-
-      doc.fontSize(16).text('Call Metrics');
-      doc.fontSize(12)
-        .text(`Total Calls: ${report.callMetrics.totalCalls}`)
-        .text(`Completed Calls: ${report.callMetrics.completedCalls}`)
-        .text(`Successful Calls: ${report.callMetrics.successfulCalls}`)
-        .text(`Total Duration: ${Math.floor(report.callMetrics.totalCallDuration / 60)} minutes`);
-      doc.moveDown();
-
-      doc.fontSize(16).text('Lead Metrics');
-      doc.fontSize(12)
-        .text(`New Leads: ${report.leadMetrics.newLeads}`)
-        .text(`Contacted Leads: ${report.leadMetrics.contactedLeads}`)
-        .text(`Converted Leads: ${report.leadMetrics.convertedLeads}`);
-      doc.moveDown();
-
-      doc.fontSize(16).text('Performance');
-      doc.fontSize(12)
-        .text(`Connection Rate: ${report.performanceMetrics.connectionRate}%`)
-        .text(`Conversion Rate: ${report.performanceMetrics.conversionRate}%`);
-
-      if (report.notes) {
-        doc.moveDown();
-        doc.fontSize(16).text('Notes');
-        doc.fontSize(12).text(report.notes);
-      }
-
-      doc.end();
-    }
-
-    // Log export
-    report.exports.push({
-      format,
-      exportedAt: new Date(),
-      exportedBy: req.user._id
+    res.json({
+      success: true,
+      message: 'Report generated successfully',
+      ...result
     });
-    await report.save();
 
   } catch (error) {
-    console.error('Export report error:', error);
-    res.status(500).json({ message: 'Server error exporting report' });
+    console.error('Generate report error:', error);
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// @route   GET /api/reports/download/:filename
+// @desc    Download generated report file
+// @access  Private
+router.get('/download/:filename', verifyToken, async (req, res) => {
+  try {
+    const { filename } = req.params;
+    const filePath = require('path').join(__dirname, '../reports', filename);
+
+    // Check if file exists
+    const fs = require('fs');
+    if (!fs.existsSync(filePath)) {
+      return res.status(404).json({ message: 'File not found' });
+    }
+
+    // Set appropriate headers
+    res.setHeader('Content-Type', 'application/octet-stream');
+    res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+
+    // Send file
+    res.sendFile(filePath);
+
+  } catch (error) {
+    console.error('Download report error:', error);
+    res.status(500).json({ message: 'Server error' });
   }
 });
 
 // @route   DELETE /api/reports/:id
 // @desc    Delete report (Admin only)
 // @access  Private (Admin)
-router.delete('/:id', [verifyToken, requireSupervisor], async (req, res) => {
+router.delete('/:id', [
+  verifyToken,
+  requireRole('admin')
+], async (req, res) => {
   try {
     const report = await Report.findById(req.params.id);
     if (!report) {
@@ -636,11 +568,14 @@ router.delete('/:id', [verifyToken, requireSupervisor], async (req, res) => {
 
     await Report.findByIdAndDelete(req.params.id);
 
-    res.json({ message: 'Report deleted successfully' });
+    res.json({
+      success: true,
+      message: 'Report deleted successfully'
+    });
 
   } catch (error) {
     console.error('Delete report error:', error);
-    res.status(500).json({ message: 'Server error deleting report' });
+    res.status(500).json({ message: 'Server error' });
   }
 });
 
