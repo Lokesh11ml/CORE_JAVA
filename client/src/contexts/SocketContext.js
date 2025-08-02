@@ -14,216 +14,291 @@ export const useSocket = () => {
 };
 
 export const SocketProvider = ({ children }) => {
+  const { user, isAuthenticated } = useAuth();
   const [socket, setSocket] = useState(null);
   const [isConnected, setIsConnected] = useState(false);
   const [notifications, setNotifications] = useState([]);
-  const { user, isAuthenticated } = useAuth();
+  const [unreadCount, setUnreadCount] = useState(0);
 
+  // Initialize socket connection
   useEffect(() => {
-    if (isAuthenticated && user) {
-      // Initialize socket connection
-      const newSocket = io(process.env.REACT_APP_SERVER_URL || 'http://localhost:5000', {
-        transports: ['websocket'],
-        upgrade: true
-      });
-
-      // Connection event handlers
-      newSocket.on('connect', () => {
-        console.log('Socket connected:', newSocket.id);
-        setIsConnected(true);
-        
-        // Join user-specific room
-        newSocket.emit('join-user-room', user._id);
-      });
-
-      newSocket.on('disconnect', () => {
-        console.log('Socket disconnected');
-        setIsConnected(false);
-      });
-
-      newSocket.on('connect_error', (error) => {
-        console.error('Socket connection error:', error);
-        setIsConnected(false);
-      });
-
-      // Lead assignment notifications
-      newSocket.on('new-lead-assigned', (data) => {
-        toast.success(`New lead assigned: ${data.lead.name}`);
-        addNotification({
-          id: Date.now(),
-          type: 'lead_assigned',
-          title: 'New Lead Assigned',
-          message: `You have been assigned a new lead: ${data.lead.name}`,
-          data: data.lead,
-          timestamp: new Date()
-        });
-      });
-
-      // Lead reassignment notifications
-      newSocket.on('lead-reassigned', (data) => {
-        toast.info('A lead has been reassigned');
-        addNotification({
-          id: Date.now(),
-          type: 'lead_reassigned',
-          title: 'Lead Reassigned',
-          message: 'One of your leads has been reassigned to another telecaller',
-          data: data,
-          timestamp: new Date()
-        });
-      });
-
-      // Call completion notifications
-      newSocket.on('call-completed', (data) => {
-        if (data.telecaller._id !== user._id) {
-          addNotification({
-            id: Date.now(),
-            type: 'call_completed',
-            title: 'Call Completed',
-            message: `${data.telecaller.name} completed a call`,
-            data: data.call,
-            timestamp: new Date()
-          });
-        }
-      });
-
-      // User status updates
-      newSocket.on('user-status-updated', (data) => {
-        if (data.userId !== user._id) {
-          // Handle team member status updates for supervisors
-          addNotification({
-            id: Date.now(),
-            type: 'status_update',
-            title: 'Status Update',
-            message: `Team member status updated to ${data.status}`,
-            data: data,
-            timestamp: new Date(),
-            priority: 'low'
-          });
-        }
-      });
-
-      // Report submission notifications (for supervisors)
-      newSocket.on('report-submitted', (data) => {
-        if (user.role === 'supervisor' && user.teamMembers.includes(data.userId)) {
-          toast.info('New report submitted for review');
-          addNotification({
-            id: Date.now(),
-            type: 'report_submitted',
-            title: 'Report Submitted',
-            message: `${data.userName} has submitted a report for review`,
-            data: data,
-            timestamp: new Date()
-          });
-        }
-      });
-
-      // System announcements
-      newSocket.on('system-announcement', (data) => {
-        toast.info(data.message);
-        addNotification({
-          id: Date.now(),
-          type: 'announcement',
-          title: 'System Announcement',
-          message: data.message,
-          data: data,
-          timestamp: new Date(),
-          priority: 'high'
-        });
-      });
-
-      setSocket(newSocket);
-
-      // Cleanup on unmount
-      return () => {
-        newSocket.close();
+    if (!isAuthenticated || !user) {
+      if (socket) {
+        socket.disconnect();
         setSocket(null);
         setIsConnected(false);
-      };
+      }
+      return;
     }
+
+    // Create socket connection
+    const newSocket = io(process.env.REACT_APP_SOCKET_URL || 'http://localhost:5000', {
+      auth: {
+        token: localStorage.getItem('token')
+      },
+      transports: ['websocket', 'polling']
+    });
+
+    // Connection events
+    newSocket.on('connect', () => {
+      console.log('Socket connected');
+      setIsConnected(true);
+      
+      // Join user-specific room
+      newSocket.emit('join-user-room', user._id);
+      
+      // Update user status to online
+      newSocket.emit('user-online', { userId: user._id });
+    });
+
+    newSocket.on('disconnect', () => {
+      console.log('Socket disconnected');
+      setIsConnected(false);
+    });
+
+    newSocket.on('connect_error', (error) => {
+      console.error('Socket connection error:', error);
+      setIsConnected(false);
+    });
+
+    // Real-time notifications
+    newSocket.on('notification', (notification) => {
+      console.log('New notification:', notification);
+      
+      // Add to notifications list
+      setNotifications(prev => [notification, ...prev]);
+      setUnreadCount(prev => prev + 1);
+      
+      // Show toast notification
+      if (notification.type === 'success') {
+        toast.success(notification.message);
+      } else if (notification.type === 'error') {
+        toast.error(notification.message);
+      } else if (notification.type === 'warning') {
+        toast(notification.message, { icon: '⚠️' });
+      } else {
+        toast(notification.message);
+      }
+    });
+
+    // Lead assignment notifications
+    newSocket.on('new-lead-assigned', (data) => {
+      const notification = {
+        id: Date.now(),
+        type: 'info',
+        title: 'New Lead Assigned',
+        message: `Lead "${data.name}" has been assigned to you`,
+        data: data,
+        timestamp: new Date(),
+        read: false
+      };
+      
+      setNotifications(prev => [notification, ...prev]);
+      setUnreadCount(prev => prev + 1);
+      
+      toast.success(`New lead assigned: ${data.name}`);
+    });
+
+    // Call status updates
+    newSocket.on('call-status-updated', (data) => {
+      const notification = {
+        id: Date.now(),
+        type: 'info',
+        title: 'Call Status Updated',
+        message: `Call to ${data.phoneNumber} is now ${data.status}`,
+        data: data,
+        timestamp: new Date(),
+        read: false
+      };
+      
+      setNotifications(prev => [notification, ...prev]);
+      setUnreadCount(prev => prev + 1);
+    });
+
+    // Report submission notifications (for supervisors)
+    newSocket.on('report-submitted', (data) => {
+      if (user.role === 'supervisor' || user.role === 'admin') {
+        const notification = {
+          id: Date.now(),
+          type: 'info',
+          title: 'Report Submitted',
+          message: `${data.telecallerName} has submitted their daily report`,
+          data: data,
+          timestamp: new Date(),
+          read: false
+        };
+        
+        setNotifications(prev => [notification, ...prev]);
+        setUnreadCount(prev => prev + 1);
+        
+        toast.success(`${data.telecallerName} submitted their report`);
+      }
+    });
+
+    // User status changes
+    newSocket.on('user-status-changed', (data) => {
+      if (user.role === 'supervisor' || user.role === 'admin') {
+        const notification = {
+          id: Date.now(),
+          type: 'info',
+          title: 'User Status Changed',
+          message: `${data.userName} is now ${data.status}`,
+          data: data,
+          timestamp: new Date(),
+          read: false
+        };
+        
+        setNotifications(prev => [notification, ...prev]);
+        setUnreadCount(prev => prev + 1);
+      }
+    });
+
+    // Dashboard updates
+    newSocket.on('dashboard-update', (data) => {
+      const notification = {
+        id: Date.now(),
+        type: 'info',
+        title: 'Dashboard Updated',
+        message: 'New data available on dashboard',
+        data: data,
+        timestamp: new Date(),
+        read: false
+      };
+      
+      setNotifications(prev => [notification, ...prev]);
+      setUnreadCount(prev => prev + 1);
+    });
+
+    // Error notifications
+    newSocket.on('error', (error) => {
+      console.error('Socket error:', error);
+      toast.error('Connection error. Please refresh the page.');
+    });
+
+    setSocket(newSocket);
+
+    // Cleanup on unmount
+    return () => {
+      newSocket.disconnect();
+    };
   }, [isAuthenticated, user]);
 
-  // Add notification to the list
-  const addNotification = (notification) => {
-    setNotifications(prev => [notification, ...prev].slice(0, 50)); // Keep last 50 notifications
-  };
-
   // Mark notification as read
-  const markNotificationAsRead = (notificationId) => {
-    setNotifications(prev =>
-      prev.map(notif =>
-        notif.id === notificationId
-          ? { ...notif, isRead: true }
-          : notif
+  const markAsRead = (notificationId) => {
+    setNotifications(prev => 
+      prev.map(notification => 
+        notification.id === notificationId 
+          ? { ...notification, read: true }
+          : notification
       )
     );
+    setUnreadCount(prev => Math.max(0, prev - 1));
   };
 
-  // Clear all notifications
+  // Mark all notifications as read
+  const markAllAsRead = () => {
+    setNotifications(prev => 
+      prev.map(notification => ({ ...notification, read: true }))
+    );
+    setUnreadCount(0);
+  };
+
+  // Clear notifications
   const clearNotifications = () => {
     setNotifications([]);
+    setUnreadCount(0);
   };
 
-  // Clear notification by id
-  const clearNotification = (notificationId) => {
-    setNotifications(prev => prev.filter(notif => notif.id !== notificationId));
-  };
-
-  // Emit events
-  const emitEvent = (eventName, data) => {
+  // Send notification to other users
+  const sendNotification = (targetUserId, notification) => {
     if (socket && isConnected) {
-      socket.emit(eventName, data);
+      socket.emit('send-notification', {
+        targetUserId,
+        notification: {
+          ...notification,
+          timestamp: new Date()
+        }
+      });
     }
   };
 
-  // Assign lead event
-  const assignLead = (leadData) => {
-    emitEvent('assign-lead', leadData);
+  // Update user status
+  const updateStatus = (status) => {
+    if (socket && isConnected) {
+      socket.emit('update-status', { status });
+    }
   };
 
-  // Update call status event
-  const updateCallStatus = (callData) => {
-    emitEvent('update-call-status', callData);
+  // Start call
+  const startCall = (leadId, phoneNumber) => {
+    if (socket && isConnected) {
+      socket.emit('start-call', { leadId, phoneNumber });
+    }
   };
 
-  // Submit report event
+  // End call
+  const endCall = (callId, outcome, notes) => {
+    if (socket && isConnected) {
+      socket.emit('end-call', { callId, outcome, notes });
+    }
+  };
+
+  // Assign lead
+  const assignLead = (leadId, telecallerId) => {
+    if (socket && isConnected) {
+      socket.emit('assign-lead', { leadId, telecallerId });
+    }
+  };
+
+  // Submit report
   const submitReport = (reportData) => {
-    emitEvent('report-submitted', reportData);
+    if (socket && isConnected) {
+      socket.emit('submit-report', reportData);
+    }
   };
 
-  // Get unread notifications count
-  const getUnreadCount = () => {
-    return notifications.filter(notif => !notif.isRead).length;
+  // Join specific room
+  const joinRoom = (roomName) => {
+    if (socket && isConnected) {
+      socket.emit('join-room', roomName);
+    }
   };
 
-  // Get notifications by type
+  // Leave room
+  const leaveRoom = (roomName) => {
+    if (socket && isConnected) {
+      socket.emit('leave-room', roomName);
+    }
+  };
+
+  // Get filtered notifications
   const getNotificationsByType = (type) => {
-    return notifications.filter(notif => notif.type === type);
+    return notifications.filter(notification => notification.type === type);
   };
 
-  // Get high priority notifications
-  const getHighPriorityNotifications = () => {
-    return notifications.filter(notif => notif.priority === 'high' && !notif.isRead);
+  // Get unread notifications
+  const getUnreadNotifications = () => {
+    return notifications.filter(notification => !notification.read);
   };
 
   const value = {
     socket,
     isConnected,
     notifications,
-    
-    // Notification functions
-    addNotification,
-    markNotificationAsRead,
+    unreadCount,
+    markAsRead,
+    markAllAsRead,
     clearNotifications,
-    clearNotification,
-    getUnreadCount,
-    getNotificationsByType,
-    getHighPriorityNotifications,
-    
-    // Socket event functions
-    emitEvent,
+    sendNotification,
+    updateStatus,
+    startCall,
+    endCall,
     assignLead,
-    updateCallStatus,
-    submitReport
+    submitReport,
+    joinRoom,
+    leaveRoom,
+    getNotificationsByType,
+    getUnreadNotifications
   };
 
   return (

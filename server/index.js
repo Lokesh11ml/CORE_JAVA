@@ -14,6 +14,7 @@ const leadRoutes = require('./routes/leads');
 const callRoutes = require('./routes/calls');
 const reportRoutes = require('./routes/reports');
 const metaRoutes = require('./routes/meta');
+const dashboardRoutes = require('./routes/dashboard');
 
 const app = express();
 const server = createServer(app);
@@ -87,6 +88,7 @@ app.use('/api/leads', leadRoutes);
 app.use('/api/calls', callRoutes);
 app.use('/api/reports', reportRoutes);
 app.use('/api/meta', metaRoutes);
+app.use('/api/dashboard', dashboardRoutes);
 
 // Health check route
 app.get('/api/health', (req, res) => {
