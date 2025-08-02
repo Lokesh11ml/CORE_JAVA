@@ -3,9 +3,15 @@ const mongoose = require('mongoose');
 const cors = require('cors');
 const helmet = require('helmet');
 const rateLimit = require('express-rate-limit');
+const compression = require('compression');
+const morgan = require('morgan');
 const { createServer } = require('http');
 const { Server } = require('socket.io');
 require('dotenv').config();
+
+// Import services
+const leadAssignmentService = require('./services/leadAssignmentService');
+const reportService = require('./services/reportService');
 
 // Import routes
 const authRoutes = require('./routes/auth');
@@ -32,6 +38,12 @@ app.use(cors({
   credentials: true
 }));
 
+// Compression middleware
+app.use(compression());
+
+// Logging middleware
+app.use(morgan('combined'));
+
 // Rate limiting
 const limiter = rateLimit({
   windowMs: 15 * 60 * 1000, // 15 minutes
@@ -51,6 +63,9 @@ mongoose.connect(process.env.MONGODB_URI || 'mongodb://localhost:27017/telecalle
 .then(() => console.log('MongoDB connected successfully'))
 .catch(err => console.error('MongoDB connection error:', err));
 
+// Make io globally available for services
+global.io = io;
+
 // Socket.io connection handling
 io.on('connection', (socket) => {
   console.log('User connected:', socket.id);
@@ -68,6 +83,11 @@ io.on('connection', (socket) => {
   // Handle call status updates
   socket.on('update-call-status', (data) => {
     socket.broadcast.emit('call-status-updated', data);
+  });
+  
+  // Handle user status updates
+  socket.on('update-user-status', (data) => {
+    socket.broadcast.emit('user-status-updated', data);
   });
   
   socket.on('disconnect', () => {
