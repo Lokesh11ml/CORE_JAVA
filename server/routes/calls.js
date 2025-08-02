@@ -3,19 +3,23 @@ const { body, validationResult, query } = require('express-validator');
 const Call = require('../models/Call');
 const Lead = require('../models/Lead');
 const User = require('../models/User');
-const { verifyToken, requireSupervisor } = require('../middleware/auth');
+const { verifyToken, requireRole } = require('../middleware/auth');
+const twilioService = require('../services/twilioService');
 
 const router = express.Router();
 
 // @route   GET /api/calls
-// @desc    Get calls with filtering and pagination
+// @desc    Get all calls with filtering and pagination
 // @access  Private
 router.get('/', [
   verifyToken,
   query('page').optional().isInt({ min: 1 }).withMessage('Page must be a positive integer'),
   query('limit').optional().isInt({ min: 1, max: 100 }).withMessage('Limit must be between 1 and 100'),
-  query('status').optional().isIn(['scheduled', 'in_progress', 'completed', 'missed', 'cancelled', 'failed']),
-  query('outcome').optional().isIn(['connected', 'no_answer', 'busy', 'invalid_number', 'voicemail', 'callback_requested', 'not_interested', 'interested', 'converted'])
+  query('status').optional().isIn(['initiated', 'ringing', 'answered', 'completed', 'busy', 'failed', 'no-answer', 'cancelled']).withMessage('Invalid status'),
+  query('callType').optional().isIn(['outbound', 'inbound']).withMessage('Invalid call type'),
+  query('telecaller').optional().isMongoId().withMessage('Invalid telecaller ID'),
+  query('dateFrom').optional().isISO8601().withMessage('Invalid dateFrom format'),
+  query('dateTo').optional().isISO8601().withMessage('Invalid dateTo format')
 ], async (req, res) => {
   try {
     const errors = validationResult(req);
@@ -25,63 +29,346 @@ router.get('/', [
 
     const {
       page = 1,
-      limit = 20,
+      limit = 10,
       status,
-      outcome,
-      telecallerId,
-      leadId,
-      startDate,
-      endDate,
-      sortBy = 'startTime',
-      sortOrder = 'desc'
+      callType,
+      telecaller,
+      dateFrom,
+      dateTo
     } = req.query;
 
-    // Build filter object
-    const filter = {};
+    // Build query
+    const query = {};
 
     // Role-based filtering
     if (req.user.role === 'telecaller') {
-      filter.telecallerId = req.user._id;
+      query.telecaller = req.user._id;
     } else if (req.user.role === 'supervisor') {
       // Supervisor can see their team's calls
-      const teamMemberIds = [...req.user.teamMembers, req.user._id];
-      filter.telecallerId = { $in: teamMemberIds };
+      const teamMemberIds = req.user.teamMembers.map(member => member._id);
+      query.telecaller = { $in: teamMemberIds };
     }
-    // Admin can see all calls (no additional filter)
 
-    // Apply query filters
-    if (status) filter.status = status;
-    if (outcome) filter.outcome = outcome;
-    if (telecallerId && (req.user.role === 'admin' || req.user.role === 'supervisor')) {
-      filter.telecallerId = telecallerId;
-    }
-    if (leadId) filter.leadId = leadId;
+    // Apply filters
+    if (status) query.status = status;
+    if (callType) query.callType = callType;
+    if (telecaller) query.telecaller = telecaller;
 
     // Date range filter
-    if (startDate || endDate) {
-      filter.startTime = {};
-      if (startDate) filter.startTime.$gte = new Date(startDate);
-      if (endDate) filter.startTime.$lte = new Date(endDate);
+    if (dateFrom || dateTo) {
+      query.startTime = {};
+      if (dateFrom) query.startTime.$gte = new Date(dateFrom);
+      if (dateTo) query.startTime.$lte = new Date(dateTo);
     }
 
-    // Pagination
-    const skip = (page - 1) * limit;
-    const sortObj = { [sortBy]: sortOrder === 'desc' ? -1 : 1 };
+    // Calculate pagination
+    const skip = (parseInt(page) - 1) * parseInt(limit);
 
-    // Execute query
-    const calls = await Call.find(filter)
-      .populate('telecallerId', 'name email role')
-      .populate('leadId', 'name email phone status priority')
-      .populate('reviewedBy', 'name email')
-      .sort(sortObj)
+    // Get calls with population
+    const calls = await Call.find(query)
+      .populate('telecaller', 'name email role')
+      .populate('lead', 'name phone email')
+      .sort({ startTime: -1 })
       .skip(skip)
       .limit(parseInt(limit));
 
-    const total = await Call.countDocuments(filter);
+    // Get total count
+    const total = await Call.countDocuments(query);
 
-    // Calculate statistics
+    // Calculate pagination info
+    const pages = Math.ceil(total / parseInt(limit));
+
+    res.json({
+      success: true,
+      calls,
+      pagination: {
+        page: parseInt(page),
+        limit: parseInt(limit),
+        total,
+        pages
+      }
+    });
+
+  } catch (error) {
+    console.error('Get calls error:', error);
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// @route   POST /api/calls/initiate
+// @desc    Initiate a call to a lead
+// @access  Private
+router.post('/initiate', [
+  verifyToken,
+  body('leadId').isMongoId().withMessage('Invalid lead ID'),
+  body('callType').optional().isIn(['outbound', 'inbound']).withMessage('Invalid call type')
+], async (req, res) => {
+  try {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+      return res.status(400).json({ errors: errors.array() });
+    }
+
+    const { leadId, callType = 'outbound' } = req.body;
+
+    // Check if lead exists
+    const lead = await Lead.findById(leadId);
+    if (!lead) {
+      return res.status(404).json({ message: 'Lead not found' });
+    }
+
+    // Check if user can call this lead
+    if (req.user.role === 'telecaller' && lead.assignedTo.toString() !== req.user._id.toString()) {
+      return res.status(403).json({ message: 'Access denied to this lead' });
+    }
+
+    // Check if user is available
+    if (req.user.currentStatus === 'offline' || req.user.currentStatus === 'busy') {
+      return res.status(400).json({ message: 'You must be available to make calls' });
+    }
+
+    // Initiate call via Twilio
+    const callResult = await twilioService.initiateCall(req.user._id, leadId, callType);
+
+    res.json({
+      success: true,
+      message: 'Call initiated successfully',
+      call: callResult.call,
+      twilioCall: callResult.twilioCall
+    });
+
+  } catch (error) {
+    console.error('Initiate call error:', error);
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// @route   GET /api/calls/:id
+// @desc    Get specific call details
+// @access  Private
+router.get('/:id', [
+  verifyToken,
+  body('id').isMongoId().withMessage('Invalid call ID')
+], async (req, res) => {
+  try {
+    const call = await Call.findById(req.params.id)
+      .populate('telecaller', 'name email role')
+      .populate('lead', 'name phone email status');
+
+    if (!call) {
+      return res.status(404).json({ message: 'Call not found' });
+    }
+
+    // Check access permissions
+    if (req.user.role === 'telecaller' && call.telecaller._id.toString() !== req.user._id.toString()) {
+      return res.status(403).json({ message: 'Access denied' });
+    }
+
+    res.json({
+      success: true,
+      call
+    });
+
+  } catch (error) {
+    console.error('Get call error:', error);
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// @route   PUT /api/calls/:id
+// @desc    Update call details
+// @access  Private
+router.put('/:id', [
+  verifyToken,
+  body('status').optional().isIn(['initiated', 'ringing', 'answered', 'completed', 'busy', 'failed', 'no-answer', 'cancelled']).withMessage('Invalid status'),
+  body('outcome').optional().isIn(['connected', 'no_answer', 'busy', 'voicemail', 'wrong_number', 'disconnected']).withMessage('Invalid outcome'),
+  body('notes').optional().isString().withMessage('Notes must be a string'),
+  body('summary').optional().isString().withMessage('Summary must be a string'),
+  body('callQuality').optional().isIn(['excellent', 'good', 'fair', 'poor']).withMessage('Invalid call quality'),
+  body('customerSatisfaction').optional().isInt({ min: 1, max: 5 }).withMessage('Customer satisfaction must be between 1 and 5')
+], async (req, res) => {
+  try {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+      return res.status(400).json({ errors: errors.array() });
+    }
+
+    const call = await Call.findById(req.params.id);
+    if (!call) {
+      return res.status(404).json({ message: 'Call not found' });
+    }
+
+    // Check access permissions
+    if (req.user.role === 'telecaller' && call.telecaller.toString() !== req.user._id.toString()) {
+      return res.status(403).json({ message: 'Access denied' });
+    }
+
+    // Update call
+    const updatedCall = await Call.findByIdAndUpdate(
+      req.params.id,
+      req.body,
+      { new: true, runValidators: true }
+    ).populate('telecaller', 'name email role')
+     .populate('lead', 'name phone email');
+
+    res.json({
+      success: true,
+      message: 'Call updated successfully',
+      call: updatedCall
+    });
+
+  } catch (error) {
+    console.error('Update call error:', error);
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// @route   POST /api/calls/status-callback
+// @desc    Twilio webhook for call status updates
+// @access  Public
+router.post('/status-callback', async (req, res) => {
+  try {
+    const {
+      CallSid,
+      CallStatus,
+      CallDuration,
+      RecordingUrl,
+      RecordingDuration
+    } = req.body;
+
+    // Verify webhook signature
+    const signature = req.headers['x-twilio-signature'];
+    const url = `${req.protocol}://${req.get('host')}${req.originalUrl}`;
+    
+    if (!twilioService.verifyWebhookSignature(signature, url, req.body)) {
+      return res.status(403).json({ message: 'Invalid webhook signature' });
+    }
+
+    // Handle call status update
+    await twilioService.handleCallStatus(CallSid, CallStatus, CallDuration, RecordingUrl);
+
+    res.status(200).send('OK');
+
+  } catch (error) {
+    console.error('Call status callback error:', error);
+    res.status(500).send('Error');
+  }
+});
+
+// @route   POST /api/calls/recording-status
+// @desc    Twilio webhook for recording status updates
+// @access  Public
+router.post('/recording-status', async (req, res) => {
+  try {
+    const {
+      CallSid,
+      RecordingUrl,
+      RecordingDuration
+    } = req.body;
+
+    // Verify webhook signature
+    const signature = req.headers['x-twilio-signature'];
+    const url = `${req.protocol}://${req.get('host')}${req.originalUrl}`;
+    
+    if (!twilioService.verifyWebhookSignature(signature, url, req.body)) {
+      return res.status(403).json({ message: 'Invalid webhook signature' });
+    }
+
+    // Handle recording status update
+    await twilioService.handleRecordingStatus(CallSid, RecordingUrl, RecordingDuration);
+
+    res.status(200).send('OK');
+
+  } catch (error) {
+    console.error('Recording status callback error:', error);
+    res.status(500).send('Error');
+  }
+});
+
+// @route   GET /api/calls/twiml/:callId
+// @desc    Generate TwiML for call
+// @access  Public
+router.get('/twiml/:callId', async (req, res) => {
+  try {
+    const { callId } = req.params;
+
+    const call = await Call.findById(callId);
+    if (!call) {
+      return res.status(404).json({ message: 'Call not found' });
+    }
+
+    const twiml = twilioService.generateTwiML(callId);
+
+    res.set('Content-Type', 'text/xml');
+    res.send(twiml);
+
+  } catch (error) {
+    console.error('Generate TwiML error:', error);
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// @route   GET /api/calls/user/:userId
+// @desc    Get calls for specific user
+// @access  Private
+router.get('/user/:userId', [
+  verifyToken,
+  query('status').optional().isIn(['initiated', 'ringing', 'answered', 'completed', 'busy', 'failed', 'no-answer', 'cancelled']).withMessage('Invalid status'),
+  query('dateFrom').optional().isISO8601().withMessage('Invalid dateFrom format'),
+  query('dateTo').optional().isISO8601().withMessage('Invalid dateTo format')
+], async (req, res) => {
+  try {
+    const { status, dateFrom, dateTo } = req.query;
+    const { userId } = req.params;
+
+    // Check access permissions
+    if (req.user.role === 'telecaller' && userId !== req.user._id.toString()) {
+      return res.status(403).json({ message: 'Access denied' });
+    }
+
+    const query = { telecaller: userId };
+    if (status) query.status = status;
+
+    // Date range filter
+    if (dateFrom || dateTo) {
+      query.startTime = {};
+      if (dateFrom) query.startTime.$gte = new Date(dateFrom);
+      if (dateTo) query.startTime.$lte = new Date(dateTo);
+    }
+
+    const calls = await Call.find(query)
+      .populate('telecaller', 'name email role')
+      .populate('lead', 'name phone email')
+      .sort({ startTime: -1 });
+
+    res.json({
+      success: true,
+      calls
+    });
+
+  } catch (error) {
+    console.error('Get user calls error:', error);
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// @route   GET /api/calls/stats/overview
+// @desc    Get call statistics overview
+// @access  Private
+router.get('/stats/overview', verifyToken, async (req, res) => {
+  try {
+    const query = {};
+
+    // Role-based filtering
+    if (req.user.role === 'telecaller') {
+      query.telecaller = req.user._id;
+    } else if (req.user.role === 'supervisor') {
+      const teamMemberIds = req.user.teamMembers.map(member => member._id);
+      query.telecaller = { $in: teamMemberIds };
+    }
+
     const stats = await Call.aggregate([
-      { $match: filter },
+      { $match: query },
       {
         $group: {
           _id: null,
@@ -89,433 +376,135 @@ router.get('/', [
           completedCalls: { $sum: { $cond: [{ $eq: ['$status', 'completed'] }, 1, 0] } },
           successfulCalls: { $sum: { $cond: ['$isSuccessful', 1, 0] } },
           totalDuration: { $sum: '$duration' },
-          averageDuration: { $avg: '$duration' }
+          averageDuration: { $avg: '$duration' },
+          missedCalls: { $sum: { $cond: [{ $eq: ['$status', 'no-answer'] }, 1, 0] } },
+          failedCalls: { $sum: { $cond: [{ $eq: ['$status', 'failed'] }, 1, 0] } }
         }
       }
     ]);
 
-    res.json({
-      calls,
-      pagination: {
-        page: parseInt(page),
-        limit: parseInt(limit),
-        total,
-        pages: Math.ceil(total / limit)
-      },
-      stats: stats[0] || {
-        totalCalls: 0,
-        completedCalls: 0,
-        successfulCalls: 0,
-        totalDuration: 0,
-        averageDuration: 0
-      }
-    });
-
-  } catch (error) {
-    console.error('Get calls error:', error);
-    res.status(500).json({ message: 'Server error fetching calls' });
-  }
-});
-
-// @route   GET /api/calls/:id
-// @desc    Get single call by ID
-// @access  Private
-router.get('/:id', verifyToken, async (req, res) => {
-  try {
-    const call = await Call.findById(req.params.id)
-      .populate('telecallerId', 'name email role phone')
-      .populate('leadId', 'name email phone status priority assignedTo')
-      .populate('reviewedBy', 'name email');
-
-    if (!call) {
-      return res.status(404).json({ message: 'Call not found' });
-    }
-
-    // Check access permissions
-    const canAccess = req.user.role === 'admin' ||
-                     (req.user.role === 'supervisor' && req.user.teamMembers.includes(call.telecallerId._id)) ||
-                     (req.user.role === 'telecaller' && call.telecallerId._id.toString() === req.user._id.toString());
-
-    if (!canAccess) {
-      return res.status(403).json({ message: 'Access denied to this call' });
-    }
-
-    res.json({ call });
-
-  } catch (error) {
-    console.error('Get call error:', error);
-    res.status(500).json({ message: 'Server error fetching call' });
-  }
-});
-
-// @route   POST /api/calls
-// @desc    Create new call log
-// @access  Private
-router.post('/', [
-  verifyToken,
-  body('leadId').isMongoId().withMessage('Valid lead ID is required'),
-  body('phoneNumber').notEmpty().withMessage('Phone number is required'),
-  body('callPurpose').isIn(['initial_contact', 'follow_up', 'closure', 'support', 'survey', 'other']).withMessage('Invalid call purpose'),
-  body('startTime').isISO8601().withMessage('Valid start time is required'),
-  body('endTime').optional().isISO8601().withMessage('Valid end time required'),
-  body('status').isIn(['scheduled', 'in_progress', 'completed', 'missed', 'cancelled', 'failed']).withMessage('Invalid status'),
-  body('outcome').optional().isIn(['connected', 'no_answer', 'busy', 'invalid_number', 'voicemail', 'callback_requested', 'not_interested', 'interested', 'converted'])
-], async (req, res) => {
-  try {
-    const errors = validationResult(req);
-    if (!errors.isEmpty()) {
-      return res.status(400).json({ errors: errors.array() });
-    }
-
-    const callData = {
-      ...req.body,
-      telecallerId: req.user._id
+    const overview = stats[0] || {
+      totalCalls: 0,
+      completedCalls: 0,
+      successfulCalls: 0,
+      totalDuration: 0,
+      averageDuration: 0,
+      missedCalls: 0,
+      failedCalls: 0
     };
 
-    // Verify lead exists and user has access
-    const lead = await Lead.findById(callData.leadId);
-    if (!lead) {
-      return res.status(404).json({ message: 'Lead not found' });
-    }
+    // Calculate rates
+    overview.successRate = overview.totalCalls > 0 ? 
+      Math.round((overview.successfulCalls / overview.totalCalls) * 100) : 0;
+    overview.completionRate = overview.totalCalls > 0 ? 
+      Math.round((overview.completedCalls / overview.totalCalls) * 100) : 0;
 
-    // Check if user can make calls for this lead
-    const canCall = req.user.role === 'admin' ||
-                   (req.user.role === 'supervisor' && req.user.teamMembers.includes(lead.assignedTo)) ||
-                   (req.user.role === 'telecaller' && lead.assignedTo.toString() === req.user._id.toString());
-
-    if (!canCall) {
-      return res.status(403).json({ message: 'Access denied to call this lead' });
-    }
-
-    // Store lead status before call
-    callData.leadStatusBefore = lead.status;
-
-    // Create call
-    const call = new Call(callData);
-    await call.save();
-
-    // Update lead's last contact date if call is completed
-    if (call.status === 'completed') {
-      lead.lastContactDate = call.endTime || call.startTime;
-      lead.followupCount += 1;
-
-      // Update lead status if provided in call data
-      if (req.body.leadStatusAfter) {
-        lead.status = req.body.leadStatusAfter;
-        call.leadStatusAfter = req.body.leadStatusAfter;
-      }
-
-      await lead.save();
-      await call.save();
-
-      // Update user statistics
-      await User.findByIdAndUpdate(req.user._id, {
-        $inc: { 
-          totalCalls: 1,
-          successfulCalls: call.isSuccessful ? 1 : 0
-        }
-      });
-    }
-
-    const populatedCall = await Call.findById(call._id)
-      .populate('telecallerId', 'name email')
-      .populate('leadId', 'name email phone status');
-
-    res.status(201).json({
-      message: 'Call logged successfully',
-      call: populatedCall
+    res.json({
+      success: true,
+      overview
     });
 
   } catch (error) {
-    console.error('Create call error:', error);
-    res.status(500).json({ message: 'Server error creating call' });
+    console.error('Get call stats error:', error);
+    res.status(500).json({ message: 'Server error' });
   }
 });
 
-// @route   PUT /api/calls/:id
-// @desc    Update call
+// @route   GET /api/calls/stats/daily
+// @desc    Get daily call statistics
 // @access  Private
-router.put('/:id', [
+router.get('/stats/daily', [
   verifyToken,
-  body('endTime').optional().isISO8601().withMessage('Valid end time required'),
-  body('status').optional().isIn(['scheduled', 'in_progress', 'completed', 'missed', 'cancelled', 'failed']),
-  body('outcome').optional().isIn(['connected', 'no_answer', 'busy', 'invalid_number', 'voicemail', 'callback_requested', 'not_interested', 'interested', 'converted']),
-  body('callQuality').optional().isIn(['excellent', 'good', 'fair', 'poor']),
-  body('customerSatisfaction').optional().isInt({ min: 1, max: 5 })
+  query('dateFrom').optional().isISO8601().withMessage('Invalid dateFrom format'),
+  query('dateTo').optional().isISO8601().withMessage('Invalid dateTo format')
 ], async (req, res) => {
   try {
-    const errors = validationResult(req);
-    if (!errors.isEmpty()) {
-      return res.status(400).json({ errors: errors.array() });
+    const { dateFrom, dateTo } = req.query;
+    const query = {};
+
+    // Role-based filtering
+    if (req.user.role === 'telecaller') {
+      query.telecaller = req.user._id;
+    } else if (req.user.role === 'supervisor') {
+      const teamMemberIds = req.user.teamMembers.map(member => member._id);
+      query.telecaller = { $in: teamMemberIds };
     }
 
-    const call = await Call.findById(req.params.id);
-    if (!call) {
-      return res.status(404).json({ message: 'Call not found' });
+    // Date range filter
+    if (dateFrom || dateTo) {
+      query.startTime = {};
+      if (dateFrom) query.startTime.$gte = new Date(dateFrom);
+      if (dateTo) query.startTime.$lte = new Date(dateTo);
     }
 
-    // Check access permissions
-    const canUpdate = req.user.role === 'admin' ||
-                     (req.user.role === 'supervisor' && req.user.teamMembers.includes(call.telecallerId)) ||
-                     (req.user.role === 'telecaller' && call.telecallerId.toString() === req.user._id.toString());
-
-    if (!canUpdate) {
-      return res.status(403).json({ message: 'Access denied to update this call' });
-    }
-
-    // Update call
-    const oldStatus = call.status;
-    Object.assign(call, req.body);
-
-    // If call is being marked as completed for the first time
-    if (call.status === 'completed' && oldStatus !== 'completed') {
-      // Update lead's last contact date
-      const lead = await Lead.findById(call.leadId);
-      if (lead) {
-        lead.lastContactDate = call.endTime || call.startTime || new Date();
-        
-        // Update lead status if provided
-        if (req.body.leadStatusAfter) {
-          lead.status = req.body.leadStatusAfter;
-          call.leadStatusAfter = req.body.leadStatusAfter;
-        }
-        
-        await lead.save();
-
-        // Update user statistics
-        await User.findByIdAndUpdate(call.telecallerId, {
-          $inc: { 
-            totalCalls: 1,
-            successfulCalls: call.isSuccessful ? 1 : 0
-          }
-        });
-      }
-    }
-
-    await call.save();
-
-    const updatedCall = await Call.findById(call._id)
-      .populate('telecallerId', 'name email')
-      .populate('leadId', 'name email phone status');
-
-    // Notify via socket if needed
-    if (req.io && call.status === 'completed') {
-      req.io.emit('call-completed', {
-        call: updatedCall,
-        telecaller: call.telecallerId,
-        timestamp: new Date()
-      });
-    }
-
-    res.json({
-      message: 'Call updated successfully',
-      call: updatedCall
-    });
-
-  } catch (error) {
-    console.error('Update call error:', error);
-    res.status(500).json({ message: 'Server error updating call' });
-  }
-});
-
-// @route   PUT /api/calls/:id/review
-// @desc    Review call (Supervisor/Admin)
-// @access  Private (Supervisor/Admin)
-router.put('/:id/review', [
-  verifyToken,
-  requireSupervisor,
-  body('reviewRating').isInt({ min: 1, max: 5 }).withMessage('Review rating must be between 1 and 5'),
-  body('reviewNotes').optional().isLength({ max: 500 }).withMessage('Review notes cannot exceed 500 characters')
-], async (req, res) => {
-  try {
-    const errors = validationResult(req);
-    if (!errors.isEmpty()) {
-      return res.status(400).json({ errors: errors.array() });
-    }
-
-    const { reviewRating, reviewNotes } = req.body;
-
-    const call = await Call.findById(req.params.id);
-    if (!call) {
-      return res.status(404).json({ message: 'Call not found' });
-    }
-
-    // Update call with review
-    call.reviewedBy = req.user._id;
-    call.reviewDate = new Date();
-    call.reviewRating = reviewRating;
-    call.reviewNotes = reviewNotes;
-
-    await call.save();
-
-    const updatedCall = await Call.findById(call._id)
-      .populate('telecallerId', 'name email')
-      .populate('leadId', 'name email phone')
-      .populate('reviewedBy', 'name email');
-
-    res.json({
-      message: 'Call reviewed successfully',
-      call: updatedCall
-    });
-
-  } catch (error) {
-    console.error('Review call error:', error);
-    res.status(500).json({ message: 'Server error reviewing call' });
-  }
-});
-
-// @route   GET /api/calls/my/dashboard
-// @desc    Get user's call dashboard
-// @access  Private
-router.get('/my/dashboard', verifyToken, async (req, res) => {
-  try {
-    const userId = req.user._id;
-    const today = new Date();
-    today.setHours(0, 0, 0, 0);
-    const tomorrow = new Date(today);
-    tomorrow.setDate(tomorrow.getDate() + 1);
-
-    // Get today's call stats
-    const todayStats = await Call.getCallStats(userId, today, tomorrow);
-
-    // Get this week's stats
-    const weekStart = new Date(today);
-    weekStart.setDate(today.getDate() - today.getDay());
-    const weekStats = await Call.getCallStats(userId, weekStart, tomorrow);
-
-    // Get upcoming scheduled calls
-    const upcomingCalls = await Call.find({
-      telecallerId: userId,
-      status: 'scheduled',
-      startTime: { $gte: new Date() }
-    })
-    .populate('leadId', 'name email phone priority')
-    .sort({ startTime: 1 })
-    .limit(10);
-
-    // Get recent completed calls
-    const recentCalls = await Call.find({
-      telecallerId: userId,
-      status: 'completed'
-    })
-    .populate('leadId', 'name email phone')
-    .sort({ endTime: -1 })
-    .limit(5);
-
-    // Get overdue follow-ups
-    const overdueFollowups = await Call.find({
-      telecallerId: userId,
-      nextFollowupDate: { $lt: new Date() },
-      status: 'completed'
-    })
-    .populate('leadId', 'name email phone')
-    .limit(10);
-
-    res.json({
-      todayStats,
-      weekStats,
-      upcomingCalls,
-      recentCalls,
-      overdueFollowups,
-      summary: {
-        upcomingCount: upcomingCalls.length,
-        recentCount: recentCalls.length,
-        overdueCount: overdueFollowups.length
-      }
-    });
-
-  } catch (error) {
-    console.error('Call dashboard error:', error);
-    res.status(500).json({ message: 'Server error fetching call dashboard' });
-  }
-});
-
-// @route   GET /api/calls/stats/:userId
-// @desc    Get call statistics for a specific user
-// @access  Private (Supervisor/Admin)
-router.get('/stats/:userId', [verifyToken, requireSupervisor], async (req, res) => {
-  try {
-    const { userId } = req.params;
-    const { startDate, endDate } = req.query;
-
-    // Verify user exists and access permissions
-    const targetUser = await User.findById(userId);
-    if (!targetUser) {
-      return res.status(404).json({ message: 'User not found' });
-    }
-
-    const start = startDate ? new Date(startDate) : new Date(Date.now() - 30 * 24 * 60 * 60 * 1000); // Last 30 days
-    const end = endDate ? new Date(endDate) : new Date();
-
-    const stats = await Call.getCallStats(userId, start, end);
-
-    // Get detailed breakdown by outcome
-    const outcomeBreakdown = await Call.aggregate([
-      {
-        $match: {
-          telecallerId: targetUser._id,
-          createdAt: { $gte: start, $lte: end }
-        }
-      },
-      {
-        $group: {
-          _id: '$outcome',
-          count: { $sum: 1 },
-          avgDuration: { $avg: '$duration' }
-        }
-      }
-    ]);
-
-    // Get daily call counts
     const dailyStats = await Call.aggregate([
+      { $match: query },
       {
-        $match: {
-          telecallerId: targetUser._id,
-          createdAt: { $gte: start, $lte: end }
+        $group: {
+          _id: {
+            date: { $dateToString: { format: '%Y-%m-%d', date: '$startTime' } },
+            status: '$status'
+          },
+          count: { $sum: 1 },
+          totalDuration: { $sum: '$duration' }
         }
       },
       {
         $group: {
-          _id: { $dateToString: { format: '%Y-%m-%d', date: '$createdAt' } },
-          calls: { $sum: 1 },
-          completed: { $sum: { $cond: [{ $eq: ['$status', 'completed'] }, 1, 0] } },
-          successful: { $sum: { $cond: ['$isSuccessful', 1, 0] } }
+          _id: '$_id.date',
+          calls: { $sum: '$count' },
+          completedCalls: {
+            $sum: {
+              $cond: [{ $eq: ['$_id.status', 'completed'] }, '$count', 0]
+            }
+          },
+          totalDuration: { $sum: '$totalDuration' }
         }
       },
       { $sort: { _id: 1 } }
     ]);
 
     res.json({
-      user: { name: targetUser.name, email: targetUser.email },
-      period: { start, end },
-      overallStats: stats,
-      outcomeBreakdown,
+      success: true,
       dailyStats
     });
 
   } catch (error) {
-    console.error('Call stats error:', error);
-    res.status(500).json({ message: 'Server error fetching call statistics' });
+    console.error('Get daily call stats error:', error);
+    res.status(500).json({ message: 'Server error' });
   }
 });
 
-// @route   DELETE /api/calls/:id
-// @desc    Delete call (Admin only)
-// @access  Private (Admin)
-router.delete('/:id', [verifyToken, requireSupervisor], async (req, res) => {
+// @route   GET /api/calls/analytics/:userId
+// @desc    Get call analytics for specific user
+// @access  Private
+router.get('/analytics/:userId', [
+  verifyToken,
+  query('dateFrom').optional().isISO8601().withMessage('Invalid dateFrom format'),
+  query('dateTo').optional().isISO8601().withMessage('Invalid dateTo format')
+], async (req, res) => {
   try {
-    const call = await Call.findById(req.params.id);
-    if (!call) {
-      return res.status(404).json({ message: 'Call not found' });
+    const { dateFrom, dateTo } = req.query;
+    const { userId } = req.params;
+
+    // Check access permissions
+    if (req.user.role === 'telecaller' && userId !== req.user._id.toString()) {
+      return res.status(403).json({ message: 'Access denied' });
     }
 
-    await Call.findByIdAndDelete(req.params.id);
+    const startDate = dateFrom ? new Date(dateFrom) : new Date(Date.now() - 30 * 24 * 60 * 60 * 1000); // Last 30 days
+    const endDate = dateTo ? new Date(dateTo) : new Date();
 
-    res.json({ message: 'Call deleted successfully' });
+    const analytics = await twilioService.getCallAnalytics(userId, startDate, endDate);
+
+    res.json({
+      success: true,
+      analytics
+    });
 
   } catch (error) {
-    console.error('Delete call error:', error);
-    res.status(500).json({ message: 'Server error deleting call' });
+    console.error('Get call analytics error:', error);
+    res.status(500).json({ message: 'Server error' });
   }
 });
 

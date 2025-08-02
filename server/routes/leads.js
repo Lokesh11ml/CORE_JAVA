@@ -2,53 +2,26 @@ const express = require('express');
 const { body, validationResult, query } = require('express-validator');
 const Lead = require('../models/Lead');
 const User = require('../models/User');
-const Call = require('../models/Call');
-const { verifyToken, requireSupervisor, canManageUser } = require('../middleware/auth');
+const { verifyToken, requireRole, canAccessResource } = require('../middleware/auth');
+const leadAssignmentService = require('../services/leadAssignmentService');
 
 const router = express.Router();
 
-// Auto-assignment algorithm
-const autoAssignLead = async (lead) => {
-  try {
-    // Find available telecallers in the same department or any department
-    const availableTelecallers = await User.find({
-      role: 'telecaller',
-      isActive: true,
-      isAvailable: true,
-      currentStatus: { $in: ['available', 'break'] }
-    }).sort({ totalLeads: 1, lastActive: 1 }); // Sort by workload and activity
-
-    if (availableTelecallers.length === 0) {
-      // If no available telecallers, assign to the one with least workload
-      const telecallers = await User.find({
-        role: 'telecaller',
-        isActive: true
-      }).sort({ totalLeads: 1 });
-
-      if (telecallers.length > 0) {
-        return telecallers[0]._id;
-      }
-      return null;
-    }
-
-    // Round-robin assignment among available telecallers
-    return availableTelecallers[0]._id;
-  } catch (error) {
-    console.error('Auto-assignment error:', error);
-    return null;
-  }
-};
-
 // @route   GET /api/leads
-// @desc    Get leads with filtering and pagination
+// @desc    Get all leads with filtering and pagination
 // @access  Private
 router.get('/', [
   verifyToken,
   query('page').optional().isInt({ min: 1 }).withMessage('Page must be a positive integer'),
   query('limit').optional().isInt({ min: 1, max: 100 }).withMessage('Limit must be between 1 and 100'),
-  query('status').optional().isIn(['new', 'contacted', 'qualified', 'interested', 'not_interested', 'callback', 'converted', 'closed']),
-  query('priority').optional().isIn(['low', 'medium', 'high', 'urgent']),
-  query('source').optional().isIn(['facebook', 'instagram', 'manual', 'website', 'referral', 'other'])
+  query('status').optional().isIn(['new', 'contacted', 'qualified', 'interested', 'not_interested', 'callback', 'converted', 'closed']).withMessage('Invalid status'),
+  query('source').optional().isIn(['facebook', 'instagram', 'manual', 'website', 'referral', 'other']).withMessage('Invalid source'),
+  query('priority').optional().isIn(['low', 'medium', 'high', 'urgent']).withMessage('Invalid priority'),
+  query('quality').optional().isIn(['hot', 'warm', 'cold']).withMessage('Invalid quality'),
+  query('assignedTo').optional().isMongoId().withMessage('Invalid assignedTo ID'),
+  query('dateFrom').optional().isISO8601().withMessage('Invalid dateFrom format'),
+  query('dateTo').optional().isISO8601().withMessage('Invalid dateTo format'),
+  query('search').optional().isString().withMessage('Search must be a string')
 ], async (req, res) => {
   try {
     const errors = validationResult(req);
@@ -58,49 +31,47 @@ router.get('/', [
 
     const {
       page = 1,
-      limit = 20,
+      limit = 10,
       status,
-      priority,
       source,
+      priority,
+      quality,
       assignedTo,
-      search,
-      startDate,
-      endDate,
-      sortBy = 'createdAt',
-      sortOrder = 'desc'
+      dateFrom,
+      dateTo,
+      search
     } = req.query;
 
-    // Build filter object
-    const filter = {};
+    // Build query
+    const query = {};
 
     // Role-based filtering
     if (req.user.role === 'telecaller') {
-      filter.assignedTo = req.user._id;
+      query.assignedTo = req.user._id;
     } else if (req.user.role === 'supervisor') {
       // Supervisor can see their team's leads
-      const teamMemberIds = [...req.user.teamMembers, req.user._id];
-      filter.assignedTo = { $in: teamMemberIds };
+      const teamMemberIds = req.user.teamMembers.map(member => member._id);
+      query.assignedTo = { $in: teamMemberIds };
     }
-    // Admin can see all leads (no additional filter)
+    // Admin can see all leads
 
-    // Apply query filters
-    if (status) filter.status = status;
-    if (priority) filter.priority = priority;
-    if (source) filter.source = source;
-    if (assignedTo && (req.user.role === 'admin' || req.user.role === 'supervisor')) {
-      filter.assignedTo = assignedTo;
-    }
+    // Apply filters
+    if (status) query.status = status;
+    if (source) query.source = source;
+    if (priority) query.priority = priority;
+    if (quality) query.quality = quality;
+    if (assignedTo) query.assignedTo = assignedTo;
 
     // Date range filter
-    if (startDate || endDate) {
-      filter.createdAt = {};
-      if (startDate) filter.createdAt.$gte = new Date(startDate);
-      if (endDate) filter.createdAt.$lte = new Date(endDate);
+    if (dateFrom || dateTo) {
+      query.createdAt = {};
+      if (dateFrom) query.createdAt.$gte = new Date(dateFrom);
+      if (dateTo) query.createdAt.$lte = new Date(dateTo);
     }
 
     // Search filter
     if (search) {
-      filter.$or = [
+      query.$or = [
         { name: { $regex: search, $options: 'i' } },
         { email: { $regex: search, $options: 'i' } },
         { phone: { $regex: search, $options: 'i' } },
@@ -108,96 +79,42 @@ router.get('/', [
       ];
     }
 
-    // Pagination
-    const skip = (page - 1) * limit;
-    const sortObj = { [sortBy]: sortOrder === 'desc' ? -1 : 1 };
+    // Calculate pagination
+    const skip = (parseInt(page) - 1) * parseInt(limit);
 
-    // Execute query
-    const leads = await Lead.find(filter)
-      .populate('assignedTo', 'name email role currentStatus')
+    // Get leads with population
+    const leads = await Lead.find(query)
+      .populate('assignedTo', 'name email role')
       .populate('assignedBy', 'name email')
-      .sort(sortObj)
+      .sort({ createdAt: -1 })
       .skip(skip)
       .limit(parseInt(limit));
 
-    const total = await Lead.countDocuments(filter);
+    // Get total count
+    const total = await Lead.countDocuments(query);
 
-    // Calculate statistics
-    const stats = await Lead.aggregate([
-      { $match: filter },
-      {
-        $group: {
-          _id: null,
-          totalLeads: { $sum: 1 },
-          newLeads: { $sum: { $cond: [{ $eq: ['$status', 'new'] }, 1, 0] } },
-          qualifiedLeads: { $sum: { $cond: [{ $eq: ['$status', 'qualified'] }, 1, 0] } },
-          convertedLeads: { $sum: { $cond: [{ $eq: ['$status', 'converted'] }, 1, 0] } },
-          avgScore: { $avg: '$score' }
-        }
-      }
-    ]);
+    // Calculate pagination info
+    const pages = Math.ceil(total / parseInt(limit));
 
     res.json({
+      success: true,
       leads,
       pagination: {
         page: parseInt(page),
         limit: parseInt(limit),
         total,
-        pages: Math.ceil(total / limit)
-      },
-      stats: stats[0] || {
-        totalLeads: 0,
-        newLeads: 0,
-        qualifiedLeads: 0,
-        convertedLeads: 0,
-        avgScore: 0
+        pages
       }
     });
 
   } catch (error) {
     console.error('Get leads error:', error);
-    res.status(500).json({ message: 'Server error fetching leads' });
-  }
-});
-
-// @route   GET /api/leads/:id
-// @desc    Get single lead by ID
-// @access  Private
-router.get('/:id', verifyToken, async (req, res) => {
-  try {
-    const lead = await Lead.findById(req.params.id)
-      .populate('assignedTo', 'name email role phone currentStatus')
-      .populate('assignedBy', 'name email');
-
-    if (!lead) {
-      return res.status(404).json({ message: 'Lead not found' });
-    }
-
-    // Check access permissions
-    const canAccess = req.user.role === 'admin' ||
-                     (req.user.role === 'supervisor' && req.user.teamMembers.includes(lead.assignedTo._id)) ||
-                     (req.user.role === 'telecaller' && lead.assignedTo._id.toString() === req.user._id.toString());
-
-    if (!canAccess) {
-      return res.status(403).json({ message: 'Access denied to this lead' });
-    }
-
-    // Get call history for this lead
-    const calls = await Call.find({ leadId: lead._id })
-      .populate('telecallerId', 'name email')
-      .sort({ createdAt: -1 })
-      .limit(10);
-
-    res.json({ lead, calls });
-
-  } catch (error) {
-    console.error('Get lead error:', error);
-    res.status(500).json({ message: 'Server error fetching lead' });
+    res.status(500).json({ message: 'Server error' });
   }
 });
 
 // @route   POST /api/leads
-// @desc    Create new lead
+// @desc    Create a new lead
 // @access  Private
 router.post('/', [
   verifyToken,
@@ -205,8 +122,10 @@ router.post('/', [
   body('email').isEmail().normalizeEmail().withMessage('Please provide a valid email'),
   body('phone').matches(/^[0-9+\-\s()]+$/).withMessage('Please provide a valid phone number'),
   body('source').isIn(['facebook', 'instagram', 'manual', 'website', 'referral', 'other']).withMessage('Invalid source'),
-  body('priority').optional().isIn(['low', 'medium', 'high', 'urgent']),
-  body('assignedTo').optional().isMongoId().withMessage('Invalid assignedTo ID')
+  body('priority').optional().isIn(['low', 'medium', 'high', 'urgent']).withMessage('Invalid priority'),
+  body('quality').optional().isIn(['hot', 'warm', 'cold']).withMessage('Invalid quality'),
+  body('requirements').optional().isString().withMessage('Requirements must be a string'),
+  body('notes').optional().isString().withMessage('Notes must be a string')
 ], async (req, res) => {
   try {
     const errors = validationResult(req);
@@ -214,57 +133,95 @@ router.post('/', [
       return res.status(400).json({ errors: errors.array() });
     }
 
-    const leadData = req.body;
-    
-    // Auto-assign if not specified
-    if (!leadData.assignedTo) {
-      const assignedUserId = await autoAssignLead(leadData);
-      if (assignedUserId) {
-        leadData.assignedTo = assignedUserId;
-        leadData.autoAssigned = true;
-      } else {
-        return res.status(400).json({ message: 'No available telecallers for assignment' });
-      }
-    }
+    const {
+      name,
+      email,
+      phone,
+      source,
+      priority = 'medium',
+      quality = 'warm',
+      requirements,
+      notes,
+      location,
+      budget
+    } = req.body;
 
-    // Set assignedBy
-    leadData.assignedBy = req.user._id;
-
-    // Create lead
-    const lead = new Lead(leadData);
-    
-    // Calculate initial score
-    lead.calculateScore();
-    
-    await lead.save();
-
-    // Update assigned user's lead count
-    await User.findByIdAndUpdate(leadData.assignedTo, {
-      $inc: { totalLeads: 1 }
+    // Check if lead already exists
+    const existingLead = await Lead.findOne({ 
+      $or: [{ email }, { phone }] 
     });
-
-    // Populate and return the created lead
-    const populatedLead = await Lead.findById(lead._id)
-      .populate('assignedTo', 'name email role')
-      .populate('assignedBy', 'name email');
-
-    // Notify assigned user via socket
-    if (req.io) {
-      req.io.to(`user-${leadData.assignedTo}`).emit('new-lead-assigned', {
-        lead: populatedLead,
-        message: 'New lead assigned to you',
-        timestamp: new Date()
+    
+    if (existingLead) {
+      return res.status(400).json({ 
+        message: 'Lead with this email or phone already exists' 
       });
     }
 
+    // Create new lead
+    const lead = new Lead({
+      name,
+      email,
+      phone,
+      source,
+      priority,
+      quality,
+      requirements,
+      notes,
+      location,
+      budget,
+      assignedBy: req.user._id
+    });
+
+    await lead.save();
+
+    // Auto-assign the lead
+    const assignmentResult = await leadAssignmentService.autoAssignLead(lead._id);
+
+    // Populate assigned user
+    await lead.populate('assignedTo', 'name email role');
+
     res.status(201).json({
+      success: true,
       message: 'Lead created successfully',
-      lead: populatedLead
+      lead,
+      assignment: assignmentResult
     });
 
   } catch (error) {
     console.error('Create lead error:', error);
-    res.status(500).json({ message: 'Server error creating lead' });
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// @route   GET /api/leads/:id
+// @desc    Get specific lead
+// @access  Private
+router.get('/:id', [
+  verifyToken,
+  body('id').isMongoId().withMessage('Invalid lead ID')
+], async (req, res) => {
+  try {
+    const lead = await Lead.findById(req.params.id)
+      .populate('assignedTo', 'name email role department')
+      .populate('assignedBy', 'name email');
+
+    if (!lead) {
+      return res.status(404).json({ message: 'Lead not found' });
+    }
+
+    // Check access permissions
+    if (req.user.role === 'telecaller' && lead.assignedTo._id.toString() !== req.user._id.toString()) {
+      return res.status(403).json({ message: 'Access denied' });
+    }
+
+    res.json({
+      success: true,
+      lead
+    });
+
+  } catch (error) {
+    console.error('Get lead error:', error);
+    res.status(500).json({ message: 'Server error' });
   }
 });
 
@@ -273,11 +230,14 @@ router.post('/', [
 // @access  Private
 router.put('/:id', [
   verifyToken,
-  body('name').optional().trim().isLength({ min: 2, max: 100 }),
-  body('email').optional().isEmail().normalizeEmail(),
-  body('phone').optional().matches(/^[0-9+\-\s()]+$/),
-  body('status').optional().isIn(['new', 'contacted', 'qualified', 'interested', 'not_interested', 'callback', 'converted', 'closed']),
-  body('priority').optional().isIn(['low', 'medium', 'high', 'urgent'])
+  body('name').optional().trim().isLength({ min: 2, max: 100 }).withMessage('Name must be between 2 and 100 characters'),
+  body('email').optional().isEmail().normalizeEmail().withMessage('Please provide a valid email'),
+  body('phone').optional().matches(/^[0-9+\-\s()]+$/).withMessage('Please provide a valid phone number'),
+  body('status').optional().isIn(['new', 'contacted', 'qualified', 'interested', 'not_interested', 'callback', 'converted', 'closed']).withMessage('Invalid status'),
+  body('priority').optional().isIn(['low', 'medium', 'high', 'urgent']).withMessage('Invalid priority'),
+  body('quality').optional().isIn(['hot', 'warm', 'cold']).withMessage('Invalid quality'),
+  body('requirements').optional().isString().withMessage('Requirements must be a string'),
+  body('notes').optional().isString().withMessage('Notes must be a string')
 ], async (req, res) => {
   try {
     const errors = validationResult(req);
@@ -291,60 +251,62 @@ router.put('/:id', [
     }
 
     // Check access permissions
-    const canUpdate = req.user.role === 'admin' ||
-                     (req.user.role === 'supervisor' && req.user.teamMembers.includes(lead.assignedTo)) ||
-                     (req.user.role === 'telecaller' && lead.assignedTo.toString() === req.user._id.toString());
-
-    if (!canUpdate) {
-      return res.status(403).json({ message: 'Access denied to update this lead' });
+    if (req.user.role === 'telecaller' && lead.assignedTo.toString() !== req.user._id.toString()) {
+      return res.status(403).json({ message: 'Access denied' });
     }
-
-    // Track status changes for conversion
-    const oldStatus = lead.status;
-    const newStatus = req.body.status;
 
     // Update lead
-    Object.assign(lead, req.body);
-    
-    // Handle conversion
-    if (newStatus === 'converted' && oldStatus !== 'converted') {
-      lead.isConverted = true;
-      lead.conversionDate = new Date();
-      
-      // Update user's conversion count
-      await User.findByIdAndUpdate(lead.assignedTo, {
-        $inc: { convertedLeads: 1 }
-      });
-    }
-
-    // Recalculate score
-    lead.calculateScore();
-    
-    await lead.save();
-
-    const updatedLead = await Lead.findById(lead._id)
-      .populate('assignedTo', 'name email role')
-      .populate('assignedBy', 'name email');
+    const updatedLead = await Lead.findByIdAndUpdate(
+      req.params.id,
+      req.body,
+      { new: true, runValidators: true }
+    ).populate('assignedTo', 'name email role');
 
     res.json({
+      success: true,
       message: 'Lead updated successfully',
       lead: updatedLead
     });
 
   } catch (error) {
     console.error('Update lead error:', error);
-    res.status(500).json({ message: 'Server error updating lead' });
+    res.status(500).json({ message: 'Server error' });
   }
 });
 
-// @route   PUT /api/leads/:id/assign
-// @desc    Reassign lead to another user
-// @access  Private (Supervisor/Admin)
-router.put('/:id/assign', [
+// @route   DELETE /api/leads/:id
+// @desc    Delete lead (Admin only)
+// @access  Private (Admin)
+router.delete('/:id', [
   verifyToken,
-  requireSupervisor,
-  body('assignedTo').isMongoId().withMessage('Valid assignedTo ID is required'),
-  body('reason').optional().isLength({ max: 200 }).withMessage('Reason cannot exceed 200 characters')
+  requireRole('admin')
+], async (req, res) => {
+  try {
+    const lead = await Lead.findById(req.params.id);
+    if (!lead) {
+      return res.status(404).json({ message: 'Lead not found' });
+    }
+
+    await Lead.findByIdAndDelete(req.params.id);
+
+    res.json({
+      success: true,
+      message: 'Lead deleted successfully'
+    });
+
+  } catch (error) {
+    console.error('Delete lead error:', error);
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// @route   POST /api/leads/:id/assign
+// @desc    Assign lead to telecaller
+// @access  Private (Admin/Supervisor)
+router.post('/:id/assign', [
+  verifyToken,
+  requireRole('admin', 'supervisor'),
+  body('assignedTo').isMongoId().withMessage('Invalid telecaller ID')
 ], async (req, res) => {
   try {
     const errors = validationResult(req);
@@ -352,143 +314,185 @@ router.put('/:id/assign', [
       return res.status(400).json({ errors: errors.array() });
     }
 
-    const { assignedTo, reason } = req.body;
+    const { assignedTo } = req.body;
+
+    // Check if telecaller exists and is active
+    const telecaller = await User.findById(assignedTo);
+    if (!telecaller || telecaller.role !== 'telecaller' || !telecaller.isActive) {
+      return res.status(400).json({ message: 'Invalid telecaller' });
+    }
+
+    // Check if supervisor is assigning to their team member
+    if (req.user.role === 'supervisor') {
+      const isTeamMember = req.user.teamMembers.includes(assignedTo);
+      if (!isTeamMember) {
+        return res.status(403).json({ message: 'Can only assign to team members' });
+      }
+    }
 
     const lead = await Lead.findById(req.params.id);
     if (!lead) {
       return res.status(404).json({ message: 'Lead not found' });
     }
 
-    // Verify new assignee exists and is active
-    const newAssignee = await User.findOne({ _id: assignedTo, isActive: true, role: 'telecaller' });
-    if (!newAssignee) {
-      return res.status(400).json({ message: 'Invalid assignee or user not active' });
-    }
-
-    const oldAssignee = lead.assignedTo;
-
-    // Update lead
-    lead.assignedTo = assignedTo;
-    lead.assignedBy = req.user._id;
-    lead.reassignmentCount += 1;
-    if (reason) lead.notes = (lead.notes || '') + `\nReassigned: ${reason}`;
-    
-    await lead.save();
-
-    // Update user statistics
-    await User.findByIdAndUpdate(oldAssignee, { $inc: { totalLeads: -1 } });
-    await User.findByIdAndUpdate(assignedTo, { $inc: { totalLeads: 1 } });
-
-    const updatedLead = await Lead.findById(lead._id)
-      .populate('assignedTo', 'name email role')
-      .populate('assignedBy', 'name email');
-
-    // Notify both users via socket
-    if (req.io) {
-      req.io.to(`user-${assignedTo}`).emit('new-lead-assigned', {
-        lead: updatedLead,
-        message: 'Lead reassigned to you',
-        timestamp: new Date()
-      });
-      
-      req.io.to(`user-${oldAssignee}`).emit('lead-reassigned', {
-        leadId: lead._id,
-        message: 'Lead has been reassigned',
-        timestamp: new Date()
-      });
-    }
+    // Manual assignment
+    const assignmentResult = await leadAssignmentService.manualAssignLead(
+      req.params.id,
+      assignedTo,
+      req.user._id
+    );
 
     res.json({
-      message: 'Lead reassigned successfully',
-      lead: updatedLead
+      success: true,
+      message: 'Lead assigned successfully',
+      assignment: assignmentResult
     });
 
   } catch (error) {
-    console.error('Reassign lead error:', error);
-    res.status(500).json({ message: 'Server error reassigning lead' });
+    console.error('Assign lead error:', error);
+    res.status(500).json({ message: 'Server error' });
   }
 });
 
-// @route   GET /api/leads/my/dashboard
-// @desc    Get user's lead dashboard
+// @route   GET /api/leads/assigned/:userId
+// @desc    Get leads assigned to specific user
 // @access  Private
-router.get('/my/dashboard', verifyToken, async (req, res) => {
+router.get('/assigned/:userId', [
+  verifyToken,
+  query('status').optional().isIn(['new', 'contacted', 'qualified', 'interested', 'not_interested', 'callback', 'converted', 'closed']).withMessage('Invalid status')
+], async (req, res) => {
   try {
-    const userId = req.user._id;
-    
-    // Get user's leads summary
-    const leadStats = await Lead.aggregate([
-      { $match: { assignedTo: userId } },
+    const { status } = req.query;
+    const { userId } = req.params;
+
+    // Check access permissions
+    if (req.user.role === 'telecaller' && userId !== req.user._id.toString()) {
+      return res.status(403).json({ message: 'Access denied' });
+    }
+
+    const query = { assignedTo: userId };
+    if (status) query.status = status;
+
+    const leads = await Lead.find(query)
+      .populate('assignedTo', 'name email role')
+      .sort({ createdAt: -1 });
+
+    res.json({
+      success: true,
+      leads
+    });
+
+  } catch (error) {
+    console.error('Get assigned leads error:', error);
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// @route   GET /api/leads/stats/overview
+// @desc    Get lead statistics overview
+// @access  Private
+router.get('/stats/overview', verifyToken, async (req, res) => {
+  try {
+    const query = {};
+
+    // Role-based filtering
+    if (req.user.role === 'telecaller') {
+      query.assignedTo = req.user._id;
+    } else if (req.user.role === 'supervisor') {
+      const teamMemberIds = req.user.teamMembers.map(member => member._id);
+      query.assignedTo = { $in: teamMemberIds };
+    }
+
+    const stats = await Lead.aggregate([
+      { $match: query },
       {
         $group: {
-          _id: '$status',
-          count: { $sum: 1 },
-          avgScore: { $avg: '$score' }
+          _id: null,
+          totalLeads: { $sum: 1 },
+          newLeads: { $sum: { $cond: [{ $eq: ['$status', 'new'] }, 1, 0] } },
+          contactedLeads: { $sum: { $cond: [{ $eq: ['$status', 'contacted'] }, 1, 0] } },
+          qualifiedLeads: { $sum: { $cond: [{ $eq: ['$status', 'qualified'] }, 1, 0] } },
+          interestedLeads: { $sum: { $cond: [{ $eq: ['$status', 'interested'] }, 1, 0] } },
+          convertedLeads: { $sum: { $cond: [{ $eq: ['$status', 'converted'] }, 1, 0] } },
+          hotLeads: { $sum: { $cond: [{ $eq: ['$quality', 'hot'] }, 1, 0] } },
+          warmLeads: { $sum: { $cond: [{ $eq: ['$quality', 'warm'] }, 1, 0] } },
+          coldLeads: { $sum: { $cond: [{ $eq: ['$quality', 'cold'] }, 1, 0] } }
         }
       }
     ]);
 
-    // Get overdue follow-ups
-    const overdueFollowups = await Lead.find({
-      assignedTo: userId,
-      nextFollowupDate: { $lt: new Date() },
-      status: { $nin: ['converted', 'closed'] }
-    }).populate('assignedTo', 'name email').limit(10);
-
-    // Get recent leads (last 7 days)
-    const recentLeads = await Lead.find({
-      assignedTo: userId,
-      createdAt: { $gte: new Date(Date.now() - 7 * 24 * 60 * 60 * 1000) }
-    }).limit(5);
-
-    // Get high priority leads
-    const priorityLeads = await Lead.find({
-      assignedTo: userId,
-      priority: { $in: ['high', 'urgent'] },
-      status: { $nin: ['converted', 'closed'] }
-    }).limit(10);
+    const overview = stats[0] || {
+      totalLeads: 0,
+      newLeads: 0,
+      contactedLeads: 0,
+      qualifiedLeads: 0,
+      interestedLeads: 0,
+      convertedLeads: 0,
+      hotLeads: 0,
+      warmLeads: 0,
+      coldLeads: 0
+    };
 
     res.json({
-      leadStats,
-      overdueFollowups,
-      recentLeads,
-      priorityLeads,
-      summary: {
-        totalLeads: leadStats.reduce((sum, stat) => sum + stat.count, 0),
-        overdueCount: overdueFollowups.length,
-        recentCount: recentLeads.length,
-        priorityCount: priorityLeads.length
-      }
+      success: true,
+      overview
     });
 
   } catch (error) {
-    console.error('Dashboard error:', error);
-    res.status(500).json({ message: 'Server error fetching dashboard' });
+    console.error('Get lead stats error:', error);
+    res.status(500).json({ message: 'Server error' });
   }
 });
 
-// @route   DELETE /api/leads/:id
-// @desc    Delete lead (Admin only)
-// @access  Private (Admin)
-router.delete('/:id', [verifyToken, requireSupervisor], async (req, res) => {
+// @route   GET /api/leads/stats/sources
+// @desc    Get lead statistics by source
+// @access  Private
+router.get('/stats/sources', verifyToken, async (req, res) => {
   try {
-    const lead = await Lead.findById(req.params.id);
-    if (!lead) {
-      return res.status(404).json({ message: 'Lead not found' });
+    const query = {};
+
+    // Role-based filtering
+    if (req.user.role === 'telecaller') {
+      query.assignedTo = req.user._id;
+    } else if (req.user.role === 'supervisor') {
+      const teamMemberIds = req.user.teamMembers.map(member => member._id);
+      query.assignedTo = { $in: teamMemberIds };
     }
 
-    // Update assigned user's lead count
-    await User.findByIdAndUpdate(lead.assignedTo, {
-      $inc: { totalLeads: -1 }
+    const sourceStats = await Lead.aggregate([
+      { $match: query },
+      {
+        $group: {
+          _id: '$source',
+          count: { $sum: 1 },
+          converted: { $sum: { $cond: [{ $eq: ['$status', 'converted'] }, 1, 0] } }
+        }
+      },
+      {
+        $project: {
+          source: '$_id',
+          count: 1,
+          converted: 1,
+          conversionRate: {
+            $cond: [
+              { $eq: ['$count', 0] },
+              0,
+              { $multiply: [{ $divide: ['$converted', '$count'] }, 100] }
+            ]
+          }
+        }
+      },
+      { $sort: { count: -1 } }
+    ]);
+
+    res.json({
+      success: true,
+      sourceStats
     });
 
-    await Lead.findByIdAndDelete(req.params.id);
-
-    res.json({ message: 'Lead deleted successfully' });
-
   } catch (error) {
-    console.error('Delete lead error:', error);
-    res.status(500).json({ message: 'Server error deleting lead' });
+    console.error('Get source stats error:', error);
+    res.status(500).json({ message: 'Server error' });
   }
 });
 

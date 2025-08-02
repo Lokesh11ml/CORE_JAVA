@@ -67,6 +67,7 @@ router.post('/register', [
     delete userResponse.password;
 
     res.status(201).json({
+      success: true,
       message: 'User registered successfully',
       user: userResponse
     });
@@ -100,16 +101,16 @@ router.post('/login', [
 
     // Check if user is active
     if (!user.isActive) {
-      return res.status(401).json({ message: 'Account is deactivated. Please contact administrator.' });
+      return res.status(401).json({ message: 'Account is deactivated' });
     }
 
-    // Check password
-    const isMatch = await user.comparePassword(password);
-    if (!isMatch) {
+    // Verify password
+    const isPasswordValid = await user.comparePassword(password);
+    if (!isPasswordValid) {
       return res.status(401).json({ message: 'Invalid credentials' });
     }
 
-    // Update user status
+    // Update last active time
     user.lastActive = new Date();
     user.currentStatus = 'available';
     await user.save();
@@ -122,6 +123,7 @@ router.post('/login', [
     delete userResponse.password;
 
     res.json({
+      success: true,
       message: 'Login successful',
       token,
       user: userResponse
@@ -138,13 +140,16 @@ router.post('/login', [
 // @access  Private
 router.post('/logout', verifyToken, async (req, res) => {
   try {
-    // Update user status to offline
+    // Update user status
     await User.findByIdAndUpdate(req.user._id, {
       currentStatus: 'offline',
       lastActive: new Date()
     });
 
-    res.json({ message: 'Logout successful' });
+    res.json({
+      success: true,
+      message: 'Logged out successfully'
+    });
 
   } catch (error) {
     console.error('Logout error:', error);
@@ -152,28 +157,80 @@ router.post('/logout', verifyToken, async (req, res) => {
   }
 });
 
-// @route   GET /api/auth/me
+// @route   GET /api/auth/profile
 // @desc    Get current user profile
 // @access  Private
-router.get('/me', verifyToken, async (req, res) => {
+router.get('/profile', verifyToken, async (req, res) => {
   try {
     const user = await User.findById(req.user._id)
-      .select('-password')
       .populate('supervisor', 'name email')
-      .populate('teamMembers', 'name email role currentStatus');
+      .populate('teamMembers', 'name email role')
+      .select('-password');
 
-    res.json({ user });
+    if (!user) {
+      return res.status(404).json({ message: 'User not found' });
+    }
+
+    res.json({
+      success: true,
+      user
+    });
 
   } catch (error) {
-    console.error('Profile fetch error:', error);
-    res.status(500).json({ message: 'Server error fetching profile' });
+    console.error('Get profile error:', error);
+    res.status(500).json({ message: 'Server error' });
   }
 });
 
-// @route   PUT /api/auth/change-password
+// @route   PUT /api/auth/profile
+// @desc    Update current user profile
+// @access  Private
+router.put('/profile', [
+  verifyToken,
+  body('name').optional().trim().isLength({ min: 2, max: 50 }).withMessage('Name must be between 2 and 50 characters'),
+  body('phone').optional().matches(/^[0-9]{10}$/).withMessage('Phone must be a valid 10-digit number'),
+  body('department').optional().isIn(['sales', 'marketing', 'support', 'lead_generation', 'follow_up']).withMessage('Invalid department')
+], async (req, res) => {
+  try {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+      return res.status(400).json({ errors: errors.array() });
+    }
+
+    const { name, phone, department, avatar } = req.body;
+    const updateData = {};
+
+    if (name) updateData.name = name;
+    if (phone) updateData.phone = phone;
+    if (department) updateData.department = department;
+    if (avatar) updateData.avatar = avatar;
+
+    const user = await User.findByIdAndUpdate(
+      req.user._id,
+      updateData,
+      { new: true, runValidators: true }
+    ).select('-password');
+
+    if (!user) {
+      return res.status(404).json({ message: 'User not found' });
+    }
+
+    res.json({
+      success: true,
+      message: 'Profile updated successfully',
+      user
+    });
+
+  } catch (error) {
+    console.error('Update profile error:', error);
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// @route   POST /api/auth/change-password
 // @desc    Change user password
 // @access  Private
-router.put('/change-password', [
+router.post('/change-password', [
   verifyToken,
   body('currentPassword').exists().withMessage('Current password is required'),
   body('newPassword').isLength({ min: 6 }).withMessage('New password must be at least 6 characters')
@@ -186,9 +243,11 @@ router.put('/change-password', [
 
     const { currentPassword, newPassword } = req.body;
 
-    // Get user with password
     const user = await User.findById(req.user._id);
-    
+    if (!user) {
+      return res.status(404).json({ message: 'User not found' });
+    }
+
     // Verify current password
     const isCurrentPasswordValid = await user.comparePassword(currentPassword);
     if (!isCurrentPasswordValid) {
@@ -199,67 +258,64 @@ router.put('/change-password', [
     user.password = newPassword;
     await user.save();
 
-    res.json({ message: 'Password changed successfully' });
-
-  } catch (error) {
-    console.error('Password change error:', error);
-    res.status(500).json({ message: 'Server error changing password' });
-  }
-});
-
-// @route   PUT /api/auth/status
-// @desc    Update user status
-// @access  Private
-router.put('/status', [
-  verifyToken,
-  body('status').isIn(['available', 'busy', 'break', 'offline']).withMessage('Invalid status')
-], async (req, res) => {
-  try {
-    const errors = validationResult(req);
-    if (!errors.isEmpty()) {
-      return res.status(400).json({ errors: errors.array() });
-    }
-
-    const { status } = req.body;
-
-    await User.findByIdAndUpdate(req.user._id, {
-      currentStatus: status,
-      lastActive: new Date()
+    res.json({
+      success: true,
+      message: 'Password changed successfully'
     });
 
-    // Broadcast status update via socket
-    if (req.io) {
-      req.io.emit('user-status-updated', {
-        userId: req.user._id,
-        status,
-        timestamp: new Date()
-      });
-    }
-
-    res.json({ message: 'Status updated successfully', status });
-
   } catch (error) {
-    console.error('Status update error:', error);
-    res.status(500).json({ message: 'Server error updating status' });
+    console.error('Change password error:', error);
+    res.status(500).json({ message: 'Server error' });
   }
 });
 
 // @route   POST /api/auth/refresh-token
-// @desc    Refresh access token
+// @desc    Refresh JWT token
 // @access  Private
 router.post('/refresh-token', verifyToken, async (req, res) => {
   try {
+    const user = await User.findById(req.user._id).select('-password');
+    if (!user) {
+      return res.status(404).json({ message: 'User not found' });
+    }
+
     // Generate new token
-    const token = generateToken(req.user._id);
+    const token = generateToken(user._id);
 
     res.json({
-      message: 'Token refreshed successfully',
-      token
+      success: true,
+      token,
+      user
     });
 
   } catch (error) {
-    console.error('Token refresh error:', error);
-    res.status(500).json({ message: 'Server error refreshing token' });
+    console.error('Refresh token error:', error);
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// @route   GET /api/auth/verify
+// @desc    Verify token validity
+// @access  Private
+router.get('/verify', verifyToken, async (req, res) => {
+  try {
+    const user = await User.findById(req.user._id)
+      .populate('supervisor', 'name email')
+      .populate('teamMembers', 'name email role')
+      .select('-password');
+
+    if (!user) {
+      return res.status(404).json({ message: 'User not found' });
+    }
+
+    res.json({
+      success: true,
+      user
+    });
+
+  } catch (error) {
+    console.error('Verify token error:', error);
+    res.status(500).json({ message: 'Server error' });
   }
 });
 

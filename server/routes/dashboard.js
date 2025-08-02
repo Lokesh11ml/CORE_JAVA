@@ -1,387 +1,841 @@
 const express = require('express');
-const { verifyToken, requireRole } = require('../middleware/auth');
+const { query } = require('express-validator');
 const User = require('../models/User');
 const Lead = require('../models/Lead');
 const Call = require('../models/Call');
 const Report = require('../models/Report');
+const { verifyToken } = require('../middleware/auth');
 
 const router = express.Router();
 
-// @route   GET /api/dashboard
-// @desc    Get dashboard data based on user role
+// @route   GET /api/dashboard/overview
+// @desc    Get dashboard overview with KPIs
 // @access  Private
-router.get('/', verifyToken, async (req, res) => {
+router.get('/overview', [
+  verifyToken,
+  query('dateFrom').optional().isISO8601().withMessage('Invalid dateFrom format'),
+  query('dateTo').optional().isISO8601().withMessage('Invalid dateTo format')
+], async (req, res) => {
   try {
-    const userId = req.user._id;
-    const userRole = req.user.role;
-    const isAdmin = userRole === 'admin';
-    const isSupervisor = userRole === 'supervisor';
-    const isTelecaller = userRole === 'telecaller';
+    const { dateFrom, dateTo } = req.query;
+    const startDate = dateFrom ? new Date(dateFrom) : new Date(Date.now() - 30 * 24 * 60 * 60 * 1000);
+    const endDate = dateTo ? new Date(dateTo) : new Date();
 
-    // Get date range for today
-    const today = new Date();
-    today.setHours(0, 0, 0, 0);
-    const tomorrow = new Date(today);
-    tomorrow.setDate(tomorrow.getDate() + 1);
-
-    // Get date range for last 7 days
-    const sevenDaysAgo = new Date();
-    sevenDaysAgo.setDate(sevenDaysAgo.getDate() - 7);
-
-    // Base query conditions based on user role
-    let leadQuery = {};
-    let callQuery = {};
-    let userQuery = {};
-
-    if (isTelecaller) {
-      leadQuery.assignedTo = userId;
-      callQuery.telecallerId = userId;
-    } else if (isSupervisor) {
-      // Get team members
-      const supervisor = await User.findById(userId).populate('teamMembers');
-      const teamMemberIds = supervisor.teamMembers.map(member => member._id);
-      leadQuery.assignedTo = { $in: teamMemberIds };
-      callQuery.telecallerId = { $in: teamMemberIds };
-      userQuery._id = { $in: teamMemberIds };
+    // Build base query based on user role
+    let baseQuery = {};
+    if (req.user.role === 'telecaller') {
+      baseQuery = { assignedTo: req.user._id };
+    } else if (req.user.role === 'supervisor') {
+      const teamMemberIds = req.user.teamMembers.map(member => member._id);
+      baseQuery = { assignedTo: { $in: teamMemberIds } };
     }
-    // Admin can see all data, so no additional filters
 
-    // Get basic stats
-    const [
-      totalLeads,
-      newLeadsToday,
-      totalCalls,
-      todayCalls,
-      conversions,
-      pendingFollowups,
-      overdueFollowups
-    ] = await Promise.all([
-      Lead.countDocuments(leadQuery),
-      Lead.countDocuments({ ...leadQuery, createdAt: { $gte: today } }),
-      Call.countDocuments(callQuery),
-      Call.countDocuments({ ...callQuery, startTime: { $gte: today } }),
-      Lead.countDocuments({ ...leadQuery, status: 'converted' }),
-      Lead.countDocuments({ 
-        ...leadQuery, 
-        nextFollowupDate: { $gte: today, $lt: tomorrow },
-        status: { $nin: ['converted', 'closed'] }
-      }),
-      Lead.countDocuments({ 
-        ...leadQuery, 
-        nextFollowupDate: { $lt: today },
-        status: { $nin: ['converted', 'closed'] }
-      })
-    ]);
-
-    // Calculate success rate
-    const successfulCalls = await Call.countDocuments({
-      ...callQuery,
-      isSuccessful: true
-    });
-    const successRate = totalCalls > 0 ? Math.round((successfulCalls / totalCalls) * 100) : 0;
-
-    // Calculate conversion rate
-    const contactedLeads = await Lead.countDocuments({
-      ...leadQuery,
-      status: { $in: ['contacted', 'qualified', 'interested', 'converted'] }
-    });
-    const conversionRate = contactedLeads > 0 ? Math.round((conversions / contactedLeads) * 100) : 0;
-
-    // Get recent leads
-    const recentLeads = await Lead.find(leadQuery)
-      .sort({ createdAt: -1 })
-      .limit(5)
-      .populate('assignedTo', 'name');
-
-    // Get recent calls
-    const recentCalls = await Call.find(callQuery)
-      .sort({ startTime: -1 })
-      .limit(5)
-      .populate('leadId', 'name phone')
-      .populate('telecallerId', 'name');
-
-    // Get upcoming follow-ups
-    const upcomingFollowups = await Lead.find({
-      ...leadQuery,
-      nextFollowupDate: { $gte: today },
-      status: { $nin: ['converted', 'closed'] }
-    })
-      .sort({ nextFollowupDate: 1 })
-      .limit(10)
-      .populate('assignedTo', 'name');
-
-    // Get lead pipeline data
-    const leadPipeline = await Lead.aggregate([
-      { $match: leadQuery },
+    // Get lead statistics
+    const leadStats = await Lead.aggregate([
       {
-        $group: {
-          _id: '$status',
-          count: { $sum: 1 }
+        $match: {
+          ...baseQuery,
+          createdAt: { $gte: startDate, $lte: endDate }
         }
       },
       {
-        $project: {
-          name: '$_id',
-          value: '$count'
+        $group: {
+          _id: null,
+          totalLeads: { $sum: 1 },
+          newLeads: { $sum: { $cond: [{ $eq: ['$status', 'new'] }, 1, 0] } },
+          contactedLeads: { $sum: { $cond: [{ $eq: ['$status', 'contacted'] }, 1, 0] } },
+          qualifiedLeads: { $sum: { $cond: [{ $eq: ['$status', 'qualified'] }, 1, 0] } },
+          interestedLeads: { $sum: { $cond: [{ $eq: ['$status', 'interested'] }, 1, 0] } },
+          convertedLeads: { $sum: { $cond: [{ $eq: ['$status', 'converted'] }, 1, 0] } },
+          hotLeads: { $sum: { $cond: [{ $eq: ['$quality', 'hot'] }, 1, 0] } },
+          warmLeads: { $sum: { $cond: [{ $eq: ['$quality', 'warm'] }, 1, 0] } },
+          coldLeads: { $sum: { $cond: [{ $eq: ['$quality', 'cold'] }, 1, 0] } }
         }
       }
     ]);
 
-    // Get call trends for last 7 days
-    const callTrends = await Call.aggregate([
-      { $match: { ...callQuery, startTime: { $gte: sevenDaysAgo } } },
+    // Get call statistics
+    let callQuery = {};
+    if (req.user.role === 'telecaller') {
+      callQuery = { telecaller: req.user._id };
+    } else if (req.user.role === 'supervisor') {
+      const teamMemberIds = req.user.teamMembers.map(member => member._id);
+      callQuery = { telecaller: { $in: teamMemberIds } };
+    }
+
+    const callStats = await Call.aggregate([
+      {
+        $match: {
+          ...callQuery,
+          startTime: { $gte: startDate, $lte: endDate }
+        }
+      },
       {
         $group: {
-          _id: {
-            date: { $dateToString: { format: '%Y-%m-%d', date: '$startTime' } }
-          },
-          calls: { $sum: 1 },
-          successful: {
-            $sum: { $cond: ['$isSuccessful', 1, 0] }
-          }
+          _id: null,
+          totalCalls: { $sum: 1 },
+          completedCalls: { $sum: { $cond: [{ $eq: ['$status', 'completed'] }, 1, 0] } },
+          successfulCalls: { $sum: { $cond: ['$isSuccessful', 1, 0] } },
+          totalDuration: { $sum: '$duration' },
+          averageDuration: { $avg: '$duration' },
+          missedCalls: { $sum: { $cond: [{ $eq: ['$status', 'no-answer'] }, 1, 0] } },
+          failedCalls: { $sum: { $cond: [{ $eq: ['$status', 'failed'] }, 1, 0] } }
+        }
+      }
+    ]);
+
+    // Get user statistics
+    let userQuery = {};
+    if (req.user.role === 'supervisor') {
+      userQuery = { _id: { $in: req.user.teamMembers } };
+    } else if (req.user.role === 'admin') {
+      userQuery = { role: 'telecaller' };
+    }
+
+    const userStats = await User.aggregate([
+      {
+        $match: {
+          ...userQuery,
+          isActive: true
         }
       },
       {
-        $project: {
-          date: '$_id.date',
-          calls: 1,
-          successful: 1
+        $group: {
+          _id: null,
+          totalUsers: { $sum: 1 },
+          activeUsers: { $sum: { $cond: [{ $eq: ['$currentStatus', 'available'] }, 1, 0] } },
+          busyUsers: { $sum: { $cond: [{ $eq: ['$currentStatus', 'busy'] }, 1, 0] } },
+          offlineUsers: { $sum: { $cond: [{ $eq: ['$currentStatus', 'offline'] }, 1, 0] } }
         }
-      },
-      { $sort: { date: 1 } }
+      }
     ]);
 
-    // Get team performance (for admin/supervisor)
-    let teamPerformance = null;
-    if (isAdmin || isSupervisor) {
-      const teamQuery = isSupervisor ? userQuery : {};
-      teamPerformance = await User.aggregate([
-        { $match: { ...teamQuery, role: 'telecaller' } },
-        {
-          $lookup: {
-            from: 'calls',
-            localField: '_id',
-            foreignField: 'telecallerId',
-            as: 'calls'
-          }
-        },
-        {
-          $lookup: {
-            from: 'leads',
-            localField: '_id',
-            foreignField: 'assignedTo',
-            as: 'leads'
-          }
-        },
-        {
-          $project: {
-            name: 1,
-            calls: { $size: '$calls' },
-            conversions: {
-              $size: {
-                $filter: {
-                  input: '$leads',
-                  cond: { $eq: ['$$this.status', 'converted'] }
-                }
+    // Get report statistics
+    let reportQuery = {};
+    if (req.user.role === 'telecaller') {
+      reportQuery = { user: req.user._id };
+    } else if (req.user.role === 'supervisor') {
+      const teamMemberIds = req.user.teamMembers.map(member => member._id);
+      reportQuery = { user: { $in: teamMemberIds } };
+    }
+
+    const reportStats = await Report.aggregate([
+      {
+        $match: {
+          ...reportQuery,
+          reportDate: { $gte: startDate, $lte: endDate }
+        }
+      },
+      {
+        $group: {
+          _id: null,
+          totalReports: { $sum: 1 },
+          submittedReports: { $sum: { $cond: [{ $eq: ['$status', 'submitted'] }, 1, 0] } },
+          approvedReports: { $sum: { $cond: [{ $eq: ['$status', 'approved'] }, 1, 0] } },
+          avgEnergy: { $avg: '$energy' },
+          avgMood: {
+            $avg: {
+              $switch: {
+                branches: [
+                  { case: { $eq: ['$mood', 'excellent'] }, then: 5 },
+                  { case: { $eq: ['$mood', 'good'] }, then: 4 },
+                  { case: { $eq: ['$mood', 'average'] }, then: 3 },
+                  { case: { $eq: ['$mood', 'poor'] }, then: 2 },
+                  { case: { $eq: ['$mood', 'terrible'] }, then: 1 }
+                ],
+                default: 3
               }
             }
           }
         }
-      ]);
-    }
+      }
+    ]);
 
-    // Get notifications
-    const notifications = await getNotifications(userId, userRole);
-
-    const dashboardData = {
-      stats: {
-        totalLeads,
-        newLeadsToday,
-        totalCalls,
-        todayCalls,
-        conversions,
-        conversionRate,
-        successRate,
-        pendingFollowups,
-        overdueFollowups
-      },
-      recentLeads: recentLeads.map(lead => ({
-        _id: lead._id,
-        name: lead.name,
-        phone: lead.phone,
-        email: lead.email,
-        status: lead.status,
-        priority: lead.priority,
-        source: lead.source,
-        assignedTo: lead.assignedTo?.name
-      })),
-      recentCalls: recentCalls.map(call => ({
-        _id: call._id,
-        phoneNumber: call.phoneNumber,
-        duration: call.formattedDuration,
-        outcome: call.outcome,
-        startTime: call.startTime,
-        isSuccessful: call.isSuccessful,
-        leadName: call.leadId?.name
-      })),
-      upcomingFollowups: upcomingFollowups.map(lead => ({
-        _id: lead._id,
-        leadName: lead.name,
-        phone: lead.phone,
-        nextFollowupDate: lead.nextFollowupDate,
-        telecallerName: lead.assignedTo?.name
-      })),
-      leadPipeline,
-      callTrends,
-      teamPerformance,
-      notifications
+    // Calculate KPIs
+    const leadData = leadStats[0] || {
+      totalLeads: 0,
+      newLeads: 0,
+      contactedLeads: 0,
+      qualifiedLeads: 0,
+      interestedLeads: 0,
+      convertedLeads: 0,
+      hotLeads: 0,
+      warmLeads: 0,
+      coldLeads: 0
     };
 
-    res.json(dashboardData);
+    const callData = callStats[0] || {
+      totalCalls: 0,
+      completedCalls: 0,
+      successfulCalls: 0,
+      totalDuration: 0,
+      averageDuration: 0,
+      missedCalls: 0,
+      failedCalls: 0
+    };
+
+    const userData = userStats[0] || {
+      totalUsers: 0,
+      activeUsers: 0,
+      busyUsers: 0,
+      offlineUsers: 0
+    };
+
+    const reportData = reportStats[0] || {
+      totalReports: 0,
+      submittedReports: 0,
+      approvedReports: 0,
+      avgEnergy: 0,
+      avgMood: 0
+    };
+
+    // Calculate rates
+    const conversionRate = leadData.totalLeads > 0 ? 
+      Math.round((leadData.convertedLeads / leadData.totalLeads) * 100) : 0;
+    const successRate = callData.totalCalls > 0 ? 
+      Math.round((callData.successfulCalls / callData.totalCalls) * 100) : 0;
+    const completionRate = callData.totalCalls > 0 ? 
+      Math.round((callData.completedCalls / callData.totalCalls) * 100) : 0;
+    const submissionRate = reportData.totalReports > 0 ? 
+      Math.round((reportData.submittedReports / reportData.totalReports) * 100) : 0;
+
+    const overview = {
+      period: {
+        startDate,
+        endDate
+      },
+      leads: {
+        ...leadData,
+        conversionRate
+      },
+      calls: {
+        ...callData,
+        successRate,
+        completionRate,
+        averageDurationMinutes: Math.round(callData.averageDuration / 60)
+      },
+      users: userData,
+      reports: {
+        ...reportData,
+        submissionRate
+      }
+    };
+
+    res.json({
+      success: true,
+      overview
+    });
 
   } catch (error) {
-    console.error('Dashboard error:', error);
-    res.status(500).json({ message: 'Error fetching dashboard data' });
+    console.error('Get dashboard overview error:', error);
+    res.status(500).json({ message: 'Server error' });
   }
 });
 
-// Helper function to get notifications
-async function getNotifications(userId, userRole) {
-  const notifications = [];
+// @route   GET /api/dashboard/charts/leads
+// @desc    Get lead data for charts
+// @access  Private
+router.get('/charts/leads', [
+  verifyToken,
+  query('dateFrom').optional().isISO8601().withMessage('Invalid dateFrom format'),
+  query('dateTo').optional().isISO8601().withMessage('Invalid dateTo format'),
+  query('groupBy').optional().isIn(['day', 'week', 'month']).withMessage('Invalid groupBy')
+], async (req, res) => {
+  try {
+    const { dateFrom, dateTo, groupBy = 'day' } = req.query;
+    const startDate = dateFrom ? new Date(dateFrom) : new Date(Date.now() - 30 * 24 * 60 * 60 * 1000);
+    const endDate = dateTo ? new Date(dateTo) : new Date();
 
-  // Get overdue follow-ups
-  const overdueFollowups = await Lead.find({
-    assignedTo: userId,
-    nextFollowupDate: { $lt: new Date() },
-    status: { $nin: ['converted', 'closed'] }
-  }).count();
+    // Build base query based on user role
+    let baseQuery = {};
+    if (req.user.role === 'telecaller') {
+      baseQuery = { assignedTo: req.user._id };
+    } else if (req.user.role === 'supervisor') {
+      const teamMemberIds = req.user.teamMembers.map(member => member._id);
+      baseQuery = { assignedTo: { $in: teamMemberIds } };
+    }
 
-  if (overdueFollowups > 0) {
-    notifications.push({
-      type: 'warning',
-      message: `${overdueFollowups} follow-up(s) overdue`,
-      priority: 'high'
+    // Determine date format based on groupBy
+    let dateFormat;
+    switch (groupBy) {
+      case 'day':
+        dateFormat = '%Y-%m-%d';
+        break;
+      case 'week':
+        dateFormat = '%Y-W%U';
+        break;
+      case 'month':
+        dateFormat = '%Y-%m';
+        break;
+      default:
+        dateFormat = '%Y-%m-%d';
+    }
+
+    // Get lead trends
+    const leadTrends = await Lead.aggregate([
+      {
+        $match: {
+          ...baseQuery,
+          createdAt: { $gte: startDate, $lte: endDate }
+        }
+      },
+      {
+        $group: {
+          _id: {
+            date: { $dateToString: { format: dateFormat, date: '$createdAt' } },
+            status: '$status'
+          },
+          count: { $sum: 1 }
+        }
+      },
+      {
+        $group: {
+          _id: '$_id.date',
+          statuses: {
+            $push: {
+              status: '$_id.status',
+              count: '$count'
+            }
+          },
+          totalLeads: { $sum: '$count' }
+        }
+      },
+      { $sort: { _id: 1 } }
+    ]);
+
+    // Get lead sources
+    const leadSources = await Lead.aggregate([
+      {
+        $match: {
+          ...baseQuery,
+          createdAt: { $gte: startDate, $lte: endDate }
+        }
+      },
+      {
+        $group: {
+          _id: '$source',
+          count: { $sum: 1 },
+          converted: { $sum: { $cond: [{ $eq: ['$status', 'converted'] }, 1, 0] } }
+        }
+      },
+      {
+        $project: {
+          source: '$_id',
+          count: 1,
+          converted: 1,
+          conversionRate: {
+            $cond: [
+              { $eq: ['$count', 0] },
+              0,
+              { $multiply: [{ $divide: ['$converted', '$count'] }, 100] }
+            ]
+          }
+        }
+      },
+      { $sort: { count: -1 } }
+    ]);
+
+    // Get lead quality distribution
+    const leadQuality = await Lead.aggregate([
+      {
+        $match: {
+          ...baseQuery,
+          createdAt: { $gte: startDate, $lte: endDate }
+        }
+      },
+      {
+        $group: {
+          _id: '$quality',
+          count: { $sum: 1 }
+        }
+      },
+      { $sort: { count: -1 } }
+    ]);
+
+    res.json({
+      success: true,
+      trends: leadTrends,
+      sources: leadSources,
+      quality: leadQuality
     });
+
+  } catch (error) {
+    console.error('Get lead charts error:', error);
+    res.status(500).json({ message: 'Server error' });
   }
+});
 
-  // Get new leads assigned today
-  const today = new Date();
-  today.setHours(0, 0, 0, 0);
-  const newLeadsToday = await Lead.find({
-    assignedTo: userId,
-    createdAt: { $gte: today }
-  }).count();
+// @route   GET /api/dashboard/charts/calls
+// @desc    Get call data for charts
+// @access  Private
+router.get('/charts/calls', [
+  verifyToken,
+  query('dateFrom').optional().isISO8601().withMessage('Invalid dateFrom format'),
+  query('dateTo').optional().isISO8601().withMessage('Invalid dateTo format'),
+  query('groupBy').optional().isIn(['day', 'week', 'month']).withMessage('Invalid groupBy')
+], async (req, res) => {
+  try {
+    const { dateFrom, dateTo, groupBy = 'day' } = req.query;
+    const startDate = dateFrom ? new Date(dateFrom) : new Date(Date.now() - 30 * 24 * 60 * 60 * 1000);
+    const endDate = dateTo ? new Date(dateTo) : new Date();
 
-  if (newLeadsToday > 0) {
-    notifications.push({
-      type: 'info',
-      message: `${newLeadsToday} new lead(s) assigned today`,
-      priority: 'medium'
+    // Build base query based on user role
+    let baseQuery = {};
+    if (req.user.role === 'telecaller') {
+      baseQuery = { telecaller: req.user._id };
+    } else if (req.user.role === 'supervisor') {
+      const teamMemberIds = req.user.teamMembers.map(member => member._id);
+      baseQuery = { telecaller: { $in: teamMemberIds } };
+    }
+
+    // Determine date format based on groupBy
+    let dateFormat;
+    switch (groupBy) {
+      case 'day':
+        dateFormat = '%Y-%m-%d';
+        break;
+      case 'week':
+        dateFormat = '%Y-W%U';
+        break;
+      case 'month':
+        dateFormat = '%Y-%m';
+        break;
+      default:
+        dateFormat = '%Y-%m-%d';
+    }
+
+    // Get call trends
+    const callTrends = await Call.aggregate([
+      {
+        $match: {
+          ...baseQuery,
+          startTime: { $gte: startDate, $lte: endDate }
+        }
+      },
+      {
+        $group: {
+          _id: {
+            date: { $dateToString: { format: dateFormat, date: '$startTime' } },
+            status: '$status'
+          },
+          count: { $sum: 1 },
+          totalDuration: { $sum: '$duration' }
+        }
+      },
+      {
+        $group: {
+          _id: '$_id.date',
+          statuses: {
+            $push: {
+              status: '$_id.status',
+              count: '$count'
+            }
+          },
+          totalCalls: { $sum: '$count' },
+          totalDuration: { $sum: '$totalDuration' }
+        }
+      },
+      { $sort: { _id: 1 } }
+    ]);
+
+    // Get call outcomes
+    const callOutcomes = await Call.aggregate([
+      {
+        $match: {
+          ...baseQuery,
+          startTime: { $gte: startDate, $lte: endDate }
+        }
+      },
+      {
+        $group: {
+          _id: '$outcome',
+          count: { $sum: 1 },
+          totalDuration: { $sum: '$duration' }
+        }
+      },
+      {
+        $project: {
+          outcome: '$_id',
+          count: 1,
+          totalDuration: 1,
+          averageDuration: { $avg: '$totalDuration' }
+        }
+      },
+      { $sort: { count: -1 } }
+    ]);
+
+    // Get call quality distribution
+    const callQuality = await Call.aggregate([
+      {
+        $match: {
+          ...baseQuery,
+          startTime: { $gte: startDate, $lte: endDate }
+        }
+      },
+      {
+        $group: {
+          _id: '$callQuality',
+          count: { $sum: 1 }
+        }
+      },
+      { $sort: { count: -1 } }
+    ]);
+
+    res.json({
+      success: true,
+      trends: callTrends,
+      outcomes: callOutcomes,
+      quality: callQuality
     });
+
+  } catch (error) {
+    console.error('Get call charts error:', error);
+    res.status(500).json({ message: 'Server error' });
   }
+});
 
-  // For supervisors and admins, get team notifications
-  if (userRole === 'supervisor' || userRole === 'admin') {
-    const teamMembers = userRole === 'supervisor' 
-      ? await User.findById(userId).populate('teamMembers')
-      : await User.find({ role: 'telecaller' });
+// @route   GET /api/dashboard/charts/performance
+// @desc    Get performance data for charts
+// @access  Private
+router.get('/charts/performance', [
+  verifyToken,
+  query('dateFrom').optional().isISO8601().withMessage('Invalid dateFrom format'),
+  query('dateTo').optional().isISO8601().withMessage('Invalid dateTo format')
+], async (req, res) => {
+  try {
+    const { dateFrom, dateTo } = req.query;
+    const startDate = dateFrom ? new Date(dateFrom) : new Date(Date.now() - 30 * 24 * 60 * 60 * 1000);
+    const endDate = dateTo ? new Date(dateTo) : new Date();
 
-    const memberIds = userRole === 'supervisor' 
-      ? teamMembers.teamMembers.map(m => m._id)
-      : teamMembers.map(m => m._id);
+    // Build base query based on user role
+    let userQuery = {};
+    if (req.user.role === 'supervisor') {
+      userQuery = { _id: { $in: req.user.teamMembers } };
+    } else if (req.user.role === 'admin') {
+      userQuery = { role: 'telecaller' };
+    } else {
+      userQuery = { _id: req.user._id };
+    }
 
-    // Check for team members with no activity today
-    const inactiveMembers = await User.countDocuments({
-      _id: { $in: memberIds },
-      lastActive: { $lt: today }
+    // Get user performance
+    const userPerformance = await User.aggregate([
+      {
+        $match: {
+          ...userQuery,
+          isActive: true
+        }
+      },
+      {
+        $lookup: {
+          from: 'calls',
+          localField: '_id',
+          foreignField: 'telecaller',
+          as: 'calls'
+        }
+      },
+      {
+        $lookup: {
+          from: 'leads',
+          localField: '_id',
+          foreignField: 'assignedTo',
+          as: 'leads'
+        }
+      },
+      {
+        $project: {
+          name: 1,
+          email: 1,
+          totalCalls: { $size: '$calls' },
+          completedCalls: {
+            $size: {
+              $filter: {
+                input: '$calls',
+                cond: { $eq: ['$$this.status', 'completed'] }
+              }
+            }
+          },
+          successfulCalls: {
+            $size: {
+              $filter: {
+                input: '$calls',
+                cond: { $eq: ['$$this.isSuccessful', true] }
+              }
+            }
+          },
+          totalLeads: { $size: '$leads' },
+          convertedLeads: {
+            $size: {
+              $filter: {
+                input: '$leads',
+                cond: { $eq: ['$$this.status', 'converted'] }
+              }
+            }
+          },
+          totalDuration: {
+            $sum: '$calls.duration'
+          }
+        }
+      },
+      {
+        $project: {
+          name: 1,
+          email: 1,
+          totalCalls: 1,
+          completedCalls: 1,
+          successfulCalls: 1,
+          totalLeads: 1,
+          convertedLeads: 1,
+          totalDuration: 1,
+          successRate: {
+            $cond: [
+              { $eq: ['$totalCalls', 0] },
+              0,
+              { $multiply: [{ $divide: ['$successfulCalls', '$totalCalls'] }, 100] }
+            ]
+          },
+          conversionRate: {
+            $cond: [
+              { $eq: ['$totalLeads', 0] },
+              0,
+              { $multiply: [{ $divide: ['$convertedLeads', '$totalLeads'] }, 100] }
+            ]
+          },
+          averageDuration: {
+            $cond: [
+              { $eq: ['$totalCalls', 0] },
+              0,
+              { $divide: ['$totalDuration', '$totalCalls'] }
+            ]
+          }
+        }
+      },
+      { $sort: { successRate: -1 } }
+    ]);
+
+    // Get daily performance trends
+    const dailyPerformance = await Call.aggregate([
+      {
+        $match: {
+          startTime: { $gte: startDate, $lte: endDate }
+        }
+      },
+      {
+        $group: {
+          _id: {
+            date: { $dateToString: { format: '%Y-%m-%d', date: '$startTime' } },
+            telecaller: '$telecaller'
+          },
+          calls: { $sum: 1 },
+          successfulCalls: { $sum: { $cond: ['$isSuccessful', 1, 0] } },
+          totalDuration: { $sum: '$duration' }
+        }
+      },
+      {
+        $group: {
+          _id: '$_id.date',
+          totalCalls: { $sum: '$calls' },
+          totalSuccessful: { $sum: '$successfulCalls' },
+          totalDuration: { $sum: '$totalDuration' },
+          avgSuccessRate: {
+            $avg: {
+              $cond: [
+                { $eq: ['$calls', 0] },
+                0,
+                { $multiply: [{ $divide: ['$successfulCalls', '$calls'] }, 100] }
+              ]
+            }
+          }
+        }
+      },
+      { $sort: { _id: 1 } }
+    ]);
+
+    res.json({
+      success: true,
+      userPerformance,
+      dailyPerformance
     });
 
-    if (inactiveMembers > 0) {
-      notifications.push({
+  } catch (error) {
+    console.error('Get performance charts error:', error);
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// @route   GET /api/dashboard/recent-activity
+// @desc    Get recent activity for dashboard
+// @access  Private
+router.get('/recent-activity', [
+  verifyToken,
+  query('limit').optional().isInt({ min: 1, max: 50 }).withMessage('Limit must be between 1 and 50')
+], async (req, res) => {
+  try {
+    const { limit = 10 } = req.query;
+
+    // Build base query based on user role
+    let baseQuery = {};
+    if (req.user.role === 'telecaller') {
+      baseQuery = { assignedTo: req.user._id };
+    } else if (req.user.role === 'supervisor') {
+      const teamMemberIds = req.user.teamMembers.map(member => member._id);
+      baseQuery = { assignedTo: { $in: teamMemberIds } };
+    }
+
+    // Get recent leads
+    const recentLeads = await Lead.find(baseQuery)
+      .populate('assignedTo', 'name email')
+      .sort({ createdAt: -1 })
+      .limit(parseInt(limit));
+
+    // Get recent calls
+    let callQuery = {};
+    if (req.user.role === 'telecaller') {
+      callQuery = { telecaller: req.user._id };
+    } else if (req.user.role === 'supervisor') {
+      const teamMemberIds = req.user.teamMembers.map(member => member._id);
+      callQuery = { telecaller: { $in: teamMemberIds } };
+    }
+
+    const recentCalls = await Call.find(callQuery)
+      .populate('telecaller', 'name email')
+      .populate('lead', 'name phone')
+      .sort({ startTime: -1 })
+      .limit(parseInt(limit));
+
+    // Get recent reports
+    let reportQuery = {};
+    if (req.user.role === 'telecaller') {
+      reportQuery = { user: req.user._id };
+    } else if (req.user.role === 'supervisor') {
+      const teamMemberIds = req.user.teamMembers.map(member => member._id);
+      reportQuery = { user: { $in: teamMemberIds } };
+    }
+
+    const recentReports = await Report.find(reportQuery)
+      .populate('user', 'name email')
+      .sort({ reportDate: -1 })
+      .limit(parseInt(limit));
+
+    // Get active users
+    let userQuery = {};
+    if (req.user.role === 'supervisor') {
+      userQuery = { _id: { $in: req.user.teamMembers } };
+    } else if (req.user.role === 'admin') {
+      userQuery = { role: 'telecaller' };
+    }
+
+    const activeUsers = await User.find({
+      ...userQuery,
+      isActive: true,
+      currentStatus: { $in: ['available', 'busy'] }
+    })
+    .select('name email currentStatus lastActive')
+    .sort({ lastActive: -1 })
+    .limit(parseInt(limit));
+
+    res.json({
+      success: true,
+      recentLeads,
+      recentCalls,
+      recentReports,
+      activeUsers
+    });
+
+  } catch (error) {
+    console.error('Get recent activity error:', error);
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// @route   GET /api/dashboard/alerts
+// @desc    Get system alerts and notifications
+// @access  Private
+router.get('/alerts', verifyToken, async (req, res) => {
+  try {
+    const alerts = [];
+
+    // Check for overdue follow-ups
+    const overdueFollowups = await Lead.find({
+      nextFollowupDate: { $lt: new Date() },
+      status: { $nin: ['converted', 'closed'] }
+    }).populate('assignedTo', 'name email');
+
+    if (overdueFollowups.length > 0) {
+      alerts.push({
         type: 'warning',
-        message: `${inactiveMembers} team member(s) inactive today`,
-        priority: 'medium'
+        title: 'Overdue Follow-ups',
+        message: `${overdueFollowups.length} leads have overdue follow-ups`,
+        count: overdueFollowups.length,
+        data: overdueFollowups
       });
     }
-  }
 
-  return notifications;
-}
+    // Check for unassigned leads
+    const unassignedLeads = await Lead.find({
+      assignedTo: { $exists: false }
+    });
 
-// @route   GET /api/dashboard/analytics
-// @desc    Get detailed analytics data
-// @access  Private (Admin/Supervisor)
-router.get('/analytics', [verifyToken, requireRole('admin', 'supervisor')], async (req, res) => {
-  try {
-    const { startDate, endDate } = req.query;
-    const start = startDate ? new Date(startDate) : new Date();
-    const end = endDate ? new Date(endDate) : new Date();
+    if (unassignedLeads.length > 0) {
+      alerts.push({
+        type: 'info',
+        title: 'Unassigned Leads',
+        message: `${unassignedLeads.length} leads are waiting for assignment`,
+        count: unassignedLeads.length,
+        data: unassignedLeads
+      });
+    }
 
-    // Get detailed analytics
-    const analytics = await getDetailedAnalytics(start, end, req.user);
+    // Check for inactive users
+    const inactiveUsers = await User.find({
+      role: 'telecaller',
+      isActive: true,
+      lastActive: { $lt: new Date(Date.now() - 24 * 60 * 60 * 1000) } // 24 hours
+    });
 
-    res.json(analytics);
+    if (inactiveUsers.length > 0) {
+      alerts.push({
+        type: 'warning',
+        title: 'Inactive Users',
+        message: `${inactiveUsers.length} telecallers have been inactive for 24+ hours`,
+        count: inactiveUsers.length,
+        data: inactiveUsers
+      });
+    }
+
+    // Check for pending reports
+    let reportQuery = {};
+    if (req.user.role === 'telecaller') {
+      reportQuery = { user: req.user._id };
+    } else if (req.user.role === 'supervisor') {
+      const teamMemberIds = req.user.teamMembers.map(member => member._id);
+      reportQuery = { user: { $in: teamMemberIds } };
+    }
+
+    const pendingReports = await Report.find({
+      ...reportQuery,
+      status: 'draft',
+      reportDate: { $lt: new Date() }
+    }).populate('user', 'name email');
+
+    if (pendingReports.length > 0) {
+      alerts.push({
+        type: 'info',
+        title: 'Pending Reports',
+        message: `${pendingReports.length} reports are pending submission`,
+        count: pendingReports.length,
+        data: pendingReports
+      });
+    }
+
+    res.json({
+      success: true,
+      alerts
+    });
+
   } catch (error) {
-    console.error('Analytics error:', error);
-    res.status(500).json({ message: 'Error fetching analytics data' });
+    console.error('Get alerts error:', error);
+    res.status(500).json({ message: 'Server error' });
   }
 });
-
-// Helper function for detailed analytics
-async function getDetailedAnalytics(startDate, endDate, user) {
-  const isSupervisor = user.role === 'supervisor';
-  let userQuery = {};
-
-  if (isSupervisor) {
-    const supervisor = await User.findById(user._id).populate('teamMembers');
-    userQuery = { _id: { $in: supervisor.teamMembers.map(m => m._id) } };
-  }
-
-  // Get call analytics
-  const callAnalytics = await Call.aggregate([
-    {
-      $match: {
-        startTime: { $gte: startDate, $lte: endDate },
-        ...(isSupervisor && { telecallerId: { $in: userQuery._id.$in } })
-      }
-    },
-    {
-      $group: {
-        _id: {
-          date: { $dateToString: { format: '%Y-%m-%d', date: '$startTime' } },
-          outcome: '$outcome'
-        },
-        count: { $sum: 1 },
-        totalDuration: { $sum: '$duration' }
-      }
-    }
-  ]);
-
-  // Get lead analytics
-  const leadAnalytics = await Lead.aggregate([
-    {
-      $match: {
-        createdAt: { $gte: startDate, $lte: endDate },
-        ...(isSupervisor && { assignedTo: { $in: userQuery._id.$in } })
-      }
-    },
-    {
-      $group: {
-        _id: {
-          date: { $dateToString: { format: '%Y-%m-%d', date: '$createdAt' } },
-          status: '$status',
-          source: '$source'
-        },
-        count: { $sum: 1 }
-      }
-    }
-  ]);
-
-  return {
-    callAnalytics,
-    leadAnalytics,
-    dateRange: { startDate, endDate }
-  };
-}
 
 module.exports = router;

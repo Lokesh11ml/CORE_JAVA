@@ -1,324 +1,353 @@
 const express = require('express');
-const axios = require('axios');
 const { body, validationResult } = require('express-validator');
-const Lead = require('../models/Lead');
-const User = require('../models/User');
-const { verifyToken, requireAdmin } = require('../middleware/auth');
+const metaAdsService = require('../services/metaAdsService');
+const { verifyToken, requireRole } = require('../middleware/auth');
 
 const router = express.Router();
 
-// Auto-assignment algorithm (same as in leads.js)
-const autoAssignLead = async (leadData) => {
-  try {
-    const availableTelecallers = await User.find({
-      role: 'telecaller',
-      isActive: true,
-      isAvailable: true,
-      currentStatus: { $in: ['available', 'break'] }
-    }).sort({ totalLeads: 1, lastActive: 1 });
-
-    if (availableTelecallers.length === 0) {
-      const telecallers = await User.find({
-        role: 'telecaller',
-        isActive: true
-      }).sort({ totalLeads: 1 });
-
-      if (telecallers.length > 0) {
-        return telecallers[0]._id;
-      }
-      return null;
-    }
-
-    return availableTelecallers[0]._id;
-  } catch (error) {
-    console.error('Auto-assignment error:', error);
-    return null;
-  }
-};
-
 // @route   POST /api/meta/webhook
-// @desc    Facebook webhook for receiving leads
-// @access  Public (but verified)
+// @desc    Meta Ads webhook for lead capture
+// @access  Public
 router.post('/webhook', async (req, res) => {
   try {
-    const body = req.body;
-
-    // Verify webhook signature (Facebook security)
-    // In production, you should verify the X-Hub-Signature-256 header
-
-    if (body.object === 'page') {
-      body.entry.forEach(async (entry) => {
-        const changes = entry.changes;
-        
-        changes.forEach(async (change) => {
-          if (change.field === 'leadgen') {
-            const leadgenData = change.value;
-            
-            try {
-              // Fetch lead data from Facebook API
-              const leadData = await fetchLeadFromFacebook(leadgenData.leadgen_id);
-              
-              if (leadData) {
-                await processMetaLead(leadData, leadgenData);
-              }
-            } catch (error) {
-              console.error('Error processing Meta lead:', error);
-            }
-          }
-        });
-      });
-
-      res.status(200).send('EVENT_RECEIVED');
-    } else {
-      res.sendStatus(404);
+    // Verify webhook signature
+    const signature = req.headers['x-hub-signature-256'];
+    if (!signature) {
+      return res.status(401).json({ message: 'Missing signature' });
     }
 
+    const body = JSON.stringify(req.body);
+    if (!metaAdsService.verifyWebhookSignature(signature, body)) {
+      return res.status(401).json({ message: 'Invalid signature' });
+    }
+
+    // Handle different webhook types
+    const { object, entry } = req.body;
+
+    if (object === 'page' && entry && entry.length > 0) {
+      for (const pageEntry of entry) {
+        if (pageEntry.messaging && pageEntry.messaging.length > 0) {
+          // Handle messaging events
+          for (const messagingEvent of pageEntry.messaging) {
+            await handleMessagingEvent(messagingEvent);
+          }
+        } else if (pageEntry.changes && pageEntry.changes.length > 0) {
+          // Handle lead form submissions
+          for (const change of pageEntry.changes) {
+            if (change.value && change.value.leadgen_id) {
+              await handleLeadFormSubmission(change.value);
+            }
+          }
+        }
+      }
+    }
+
+    res.status(200).send('OK');
+
   } catch (error) {
-    console.error('Webhook error:', error);
-    res.status(500).json({ message: 'Webhook processing error' });
+    console.error('Meta webhook error:', error);
+    res.status(500).send('Error');
   }
 });
 
-// @route   GET /api/meta/webhook
-// @desc    Facebook webhook verification
-// @access  Public
-router.get('/webhook', (req, res) => {
-  const VERIFY_TOKEN = process.env.FACEBOOK_VERIFY_TOKEN || 'your_verify_token';
-  
-  const mode = req.query['hub.mode'];
-  const token = req.query['hub.verify_token'];
-  const challenge = req.query['hub.challenge'];
+// Handle messaging events
+async function handleMessagingEvent(messagingEvent) {
+  try {
+    const { sender, message, postback } = messagingEvent;
 
-  if (mode && token) {
-    if (mode === 'subscribe' && token === VERIFY_TOKEN) {
+    if (message && message.text) {
+      // Handle text messages
+      console.log('Received message:', message.text);
+    } else if (postback && postback.payload) {
+      // Handle postback events
+      console.log('Received postback:', postback.payload);
+    }
+
+  } catch (error) {
+    console.error('Handle messaging event error:', error);
+  }
+}
+
+// Handle lead form submissions
+async function handleLeadFormSubmission(leadData) {
+  try {
+    // Process the lead through Meta Ads service
+    const result = await metaAdsService.processMetaLead(leadData);
+
+    if (result.success) {
+      console.log('Lead processed successfully:', result.lead._id);
+    } else {
+      console.log('Lead processing failed:', result.message);
+    }
+
+  } catch (error) {
+    console.error('Handle lead form submission error:', error);
+  }
+}
+
+// @route   GET /api/meta/webhook
+// @desc    Meta Ads webhook verification
+// @access  Public
+router.get('/webhook', async (req, res) => {
+  try {
+    const { 'hub.mode': mode, 'hub.verify_token': token, 'hub.challenge': challenge } = req.query;
+
+    // Verify the webhook
+    if (mode === 'subscribe' && token === process.env.META_WEBHOOK_VERIFY_TOKEN) {
       console.log('Webhook verified');
       res.status(200).send(challenge);
     } else {
-      res.sendStatus(403);
+      console.log('Webhook verification failed');
+      res.status(403).send('Forbidden');
     }
-  } else {
-    res.sendStatus(400);
+
+  } catch (error) {
+    console.error('Webhook verification error:', error);
+    res.status(500).send('Error');
   }
 });
 
-// Function to fetch lead data from Facebook API
-const fetchLeadFromFacebook = async (leadId) => {
+// @route   GET /api/meta/stats
+// @desc    Get Meta Ads statistics
+// @access  Private (Admin/Supervisor)
+router.get('/stats', [
+  verifyToken,
+  requireRole('admin', 'supervisor')
+], async (req, res) => {
   try {
-    const accessToken = process.env.FACEBOOK_ACCESS_TOKEN;
-    
-    const response = await axios.get(`https://graph.facebook.com/v18.0/${leadId}`, {
-      params: {
-        access_token: accessToken,
-        fields: 'id,created_time,ad_id,ad_name,adset_id,adset_name,campaign_id,campaign_name,form_id,form_name,field_data'
-      }
+    const { startDate, endDate } = req.query;
+
+    const start = startDate ? new Date(startDate) : new Date(Date.now() - 30 * 24 * 60 * 60 * 1000);
+    const end = endDate ? new Date(endDate) : new Date();
+
+    const stats = await metaAdsService.getMetaAdsStats(start, end);
+
+    res.json({
+      success: true,
+      stats
     });
-
-    return response.data;
-  } catch (error) {
-    console.error('Error fetching lead from Facebook:', error.response?.data || error.message);
-    return null;
-  }
-};
-
-// Function to process Meta lead and create in database
-const processMetaLead = async (metaLead, webhookData) => {
-  try {
-    // Extract lead information from Meta data
-    const fieldData = metaLead.field_data || [];
-    const leadInfo = {};
-
-    // Parse field data
-    fieldData.forEach(field => {
-      const fieldName = field.name.toLowerCase();
-      const fieldValue = field.values[0];
-
-      switch (fieldName) {
-        case 'email':
-          leadInfo.email = fieldValue;
-          break;
-        case 'phone_number':
-        case 'phone':
-          leadInfo.phone = fieldValue;
-          break;
-        case 'full_name':
-        case 'name':
-          leadInfo.name = fieldValue;
-          break;
-        case 'city':
-          leadInfo.city = fieldValue;
-          break;
-        case 'state':
-          leadInfo.state = fieldValue;
-          break;
-        case 'job_title':
-          leadInfo.jobTitle = fieldValue;
-          break;
-        case 'company_name':
-          leadInfo.company = fieldValue;
-          break;
-        default:
-          // Store custom fields
-          if (!leadInfo.customFields) leadInfo.customFields = [];
-          leadInfo.customFields.push({
-            name: field.name,
-            value: fieldValue
-          });
-      }
-    });
-
-    // Validate required fields
-    if (!leadInfo.email || !leadInfo.phone || !leadInfo.name) {
-      console.error('Missing required fields in Meta lead:', leadInfo);
-      return;
-    }
-
-    // Check if lead already exists
-    const existingLead = await Lead.findOne({
-      $or: [
-        { metaLeadId: metaLead.id },
-        { email: leadInfo.email, phone: leadInfo.phone }
-      ]
-    });
-
-    if (existingLead) {
-      console.log('Lead already exists:', existingLead._id);
-      return;
-    }
-
-    // Determine source based on platform
-    let source = 'facebook';
-    if (metaLead.ad_name && metaLead.ad_name.toLowerCase().includes('instagram')) {
-      source = 'instagram';
-    }
-
-    // Auto-assign lead
-    const assignedTo = await autoAssignLead(leadInfo);
-    if (!assignedTo) {
-      console.error('No available telecaller for Meta lead assignment');
-      return;
-    }
-
-    // Create new lead
-    const newLead = new Lead({
-      name: leadInfo.name,
-      email: leadInfo.email,
-      phone: leadInfo.phone,
-      source,
-      metaLeadId: metaLead.id,
-      metaAdId: metaLead.ad_id,
-      metaCampaignId: metaLead.campaign_id,
-      metaAdSetId: metaLead.adset_id,
-      metaFormId: metaLead.form_id,
-      assignedTo,
-      autoAssigned: true,
-      priority: 'high', // Meta leads are typically high priority
-      status: 'new',
-      location: {
-        city: leadInfo.city,
-        state: leadInfo.state
-      },
-      metaData: {
-        adName: metaLead.ad_name,
-        campaignName: metaLead.campaign_name,
-        adSetName: metaLead.adset_name,
-        leadGenFormName: metaLead.form_name,
-        customFields: leadInfo.customFields || []
-      },
-      notes: `Lead received from Meta Ads on ${new Date().toLocaleDateString()}`
-    });
-
-    // Calculate score and save
-    newLead.calculateScore();
-    await newLead.save();
-
-    // Update assigned user's lead count
-    await User.findByIdAndUpdate(assignedTo, {
-      $inc: { totalLeads: 1 }
-    });
-
-    // Get populated lead for socket notification
-    const populatedLead = await Lead.findById(newLead._id)
-      .populate('assignedTo', 'name email role');
-
-    console.log('Meta lead processed successfully:', newLead._id);
-
-    // Note: Socket notification would be sent here if we had access to io
-    // This would typically be done through a message queue or event system
 
   } catch (error) {
-    console.error('Error processing Meta lead:', error);
+    console.error('Get Meta Ads stats error:', error);
+    res.status(500).json({ message: 'Server error' });
   }
-};
+});
+
+// @route   GET /api/meta/campaigns/:campaignId
+// @desc    Get leads by campaign
+// @access  Private (Admin/Supervisor)
+router.get('/campaigns/:campaignId', [
+  verifyToken,
+  requireRole('admin', 'supervisor')
+], async (req, res) => {
+  try {
+    const { campaignId } = req.params;
+    const { startDate, endDate } = req.query;
+
+    const start = startDate ? new Date(startDate) : new Date(Date.now() - 30 * 24 * 60 * 60 * 1000);
+    const end = endDate ? new Date(endDate) : new Date();
+
+    const leads = await metaAdsService.getLeadsByCampaign(campaignId, start, end);
+
+    res.json({
+      success: true,
+      leads
+    });
+
+  } catch (error) {
+    console.error('Get campaign leads error:', error);
+    res.status(500).json({ message: 'Server error' });
+  }
+});
 
 // @route   GET /api/meta/campaigns
-// @desc    Get Facebook campaigns
-// @access  Private (Admin)
-router.get('/campaigns', [verifyToken, requireAdmin], async (req, res) => {
-  try {
-    const accessToken = process.env.FACEBOOK_ACCESS_TOKEN;
-    const adAccountId = process.env.FACEBOOK_AD_ACCOUNT_ID;
-
-    if (!accessToken || !adAccountId) {
-      return res.status(400).json({ 
-        message: 'Facebook credentials not configured' 
-      });
-    }
-
-    const response = await axios.get(`https://graph.facebook.com/v18.0/act_${adAccountId}/campaigns`, {
-      params: {
-        access_token: accessToken,
-        fields: 'id,name,status,objective,created_time,updated_time',
-        limit: 50
-      }
-    });
-
-    res.json({ campaigns: response.data.data });
-
-  } catch (error) {
-    console.error('Error fetching campaigns:', error.response?.data || error.message);
-    res.status(500).json({ message: 'Error fetching campaigns from Facebook' });
-  }
-});
-
-// @route   GET /api/meta/forms
-// @desc    Get Facebook lead generation forms
-// @access  Private (Admin)
-router.get('/forms', [verifyToken, requireAdmin], async (req, res) => {
-  try {
-    const accessToken = process.env.FACEBOOK_ACCESS_TOKEN;
-    const pageId = process.env.FACEBOOK_PAGE_ID;
-
-    if (!accessToken || !pageId) {
-      return res.status(400).json({ 
-        message: 'Facebook credentials not configured' 
-      });
-    }
-
-    const response = await axios.get(`https://graph.facebook.com/v18.0/${pageId}/leadgen_forms`, {
-      params: {
-        access_token: accessToken,
-        fields: 'id,name,status,leads_count,created_time,expired_time',
-        limit: 50
-      }
-    });
-
-    res.json({ forms: response.data.data });
-
-  } catch (error) {
-    console.error('Error fetching forms:', error.response?.data || error.message);
-    res.status(500).json({ message: 'Error fetching forms from Facebook' });
-  }
-});
-
-// @route   POST /api/meta/test-lead
-// @desc    Create test lead for development
-// @access  Private (Admin)
-router.post('/test-lead', [
+// @desc    Get campaign performance
+// @access  Private (Admin/Supervisor)
+router.get('/campaigns', [
   verifyToken,
-  requireAdmin,
-  body('name').notEmpty().withMessage('Name is required'),
+  requireRole('admin', 'supervisor')
+], async (req, res) => {
+  try {
+    const { startDate, endDate } = req.query;
+
+    const start = startDate ? new Date(startDate) : new Date(Date.now() - 30 * 24 * 60 * 60 * 1000);
+    const end = endDate ? new Date(endDate) : new Date();
+
+    const performance = await metaAdsService.getCampaignPerformance(start, end);
+
+    res.json({
+      success: true,
+      performance
+    });
+
+  } catch (error) {
+    console.error('Get campaign performance error:', error);
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// @route   POST /api/meta/sync
+// @desc    Manually sync leads with Meta Ads
+// @access  Private (Admin)
+router.post('/sync', [
+  verifyToken,
+  requireRole('admin')
+], async (req, res) => {
+  try {
+    const result = await metaAdsService.syncLeadsWithMeta();
+
+    res.json({
+      success: true,
+      message: 'Meta Ads sync initiated',
+      result
+    });
+
+  } catch (error) {
+    console.error('Meta Ads sync error:', error);
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// @route   GET /api/meta/leads
+// @desc    Get Meta Ads leads with filtering
+// @access  Private (Admin/Supervisor)
+router.get('/leads', [
+  verifyToken,
+  requireRole('admin', 'supervisor')
+], async (req, res) => {
+  try {
+    const { page = 1, limit = 10, status, quality, priority, dateFrom, dateTo } = req.query;
+
+    // Build query
+    const query = { source: 'facebook' };
+
+    // Apply filters
+    if (status) query.status = status;
+    if (quality) query.quality = quality;
+    if (priority) query.priority = priority;
+
+    // Date range filter
+    if (dateFrom || dateTo) {
+      query.createdAt = {};
+      if (dateFrom) query.createdAt.$gte = new Date(dateFrom);
+      if (dateTo) query.createdAt.$lte = new Date(dateTo);
+    }
+
+    // Calculate pagination
+    const skip = (parseInt(page) - 1) * parseInt(limit);
+
+    // Get leads
+    const Lead = require('../models/Lead');
+    const leads = await Lead.find(query)
+      .populate('assignedTo', 'name email role')
+      .sort({ createdAt: -1 })
+      .skip(skip)
+      .limit(parseInt(limit));
+
+    // Get total count
+    const total = await Lead.countDocuments(query);
+
+    // Calculate pagination info
+    const pages = Math.ceil(total / parseInt(limit));
+
+    res.json({
+      success: true,
+      leads,
+      pagination: {
+        page: parseInt(page),
+        limit: parseInt(limit),
+        total,
+        pages
+      }
+    });
+
+  } catch (error) {
+    console.error('Get Meta Ads leads error:', error);
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// @route   GET /api/meta/leads/stats
+// @desc    Get Meta Ads leads statistics
+// @access  Private (Admin/Supervisor)
+router.get('/leads/stats', [
+  verifyToken,
+  requireRole('admin', 'supervisor')
+], async (req, res) => {
+  try {
+    const { startDate, endDate } = req.query;
+
+    const start = startDate ? new Date(startDate) : new Date(Date.now() - 30 * 24 * 60 * 60 * 1000);
+    const end = endDate ? new Date(endDate) : new Date();
+
+    const Lead = require('../models/Lead');
+    const stats = await Lead.aggregate([
+      {
+        $match: {
+          source: 'facebook',
+          createdAt: { $gte: start, $lte: end }
+        }
+      },
+      {
+        $group: {
+          _id: null,
+          totalLeads: { $sum: 1 },
+          newLeads: { $sum: { $cond: [{ $eq: ['$status', 'new'] }, 1, 0] } },
+          contactedLeads: { $sum: { $cond: [{ $eq: ['$status', 'contacted'] }, 1, 0] } },
+          qualifiedLeads: { $sum: { $cond: [{ $eq: ['$status', 'qualified'] }, 1, 0] } },
+          interestedLeads: { $sum: { $cond: [{ $eq: ['$status', 'interested'] }, 1, 0] } },
+          convertedLeads: { $sum: { $cond: [{ $eq: ['$status', 'converted'] }, 1, 0] } },
+          hotLeads: { $sum: { $cond: [{ $eq: ['$quality', 'hot'] }, 1, 0] } },
+          warmLeads: { $sum: { $cond: [{ $eq: ['$quality', 'warm'] }, 1, 0] } },
+          coldLeads: { $sum: { $cond: [{ $eq: ['$quality', 'cold'] }, 1, 0] } },
+          highPriority: { $sum: { $cond: [{ $eq: ['$priority', 'high'] }, 1, 0] } },
+          urgentPriority: { $sum: { $cond: [{ $eq: ['$priority', 'urgent'] }, 1, 0] } }
+        }
+      }
+    ]);
+
+    const overview = stats[0] || {
+      totalLeads: 0,
+      newLeads: 0,
+      contactedLeads: 0,
+      qualifiedLeads: 0,
+      interestedLeads: 0,
+      convertedLeads: 0,
+      hotLeads: 0,
+      warmLeads: 0,
+      coldLeads: 0,
+      highPriority: 0,
+      urgentPriority: 0
+    };
+
+    // Calculate conversion rate
+    overview.conversionRate = overview.totalLeads > 0 ? 
+      Math.round((overview.convertedLeads / overview.totalLeads) * 100) : 0;
+
+    res.json({
+      success: true,
+      overview
+    });
+
+  } catch (error) {
+    console.error('Get Meta Ads leads stats error:', error);
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// @route   POST /api/meta/test-webhook
+// @desc    Test webhook endpoint (for development)
+// @access  Private (Admin)
+router.post('/test-webhook', [
+  verifyToken,
+  requireRole('admin'),
+  body('full_name').isString().withMessage('Full name is required'),
+  body('phone_number').isString().withMessage('Phone number is required'),
   body('email').isEmail().withMessage('Valid email is required'),
-  body('phone').notEmpty().withMessage('Phone is required')
+  body('lead_id').isString().withMessage('Lead ID is required'),
+  body('campaign_id').optional().isString().withMessage('Campaign ID must be a string'),
+  body('ad_id').optional().isString().withMessage('Ad ID must be a string'),
+  body('form_id').optional().isString().withMessage('Form ID must be a string')
 ], async (req, res) => {
   try {
     const errors = validationResult(req);
@@ -326,88 +355,35 @@ router.post('/test-lead', [
       return res.status(400).json({ errors: errors.array() });
     }
 
-    const { name, email, phone, adName = 'Test Ad', campaignName = 'Test Campaign' } = req.body;
-
-    // Simulate Meta lead data
-    const testMetaLead = {
-      id: `test_${Date.now()}`,
-      created_time: new Date().toISOString(),
-      ad_id: 'test_ad_123',
-      ad_name: adName,
-      adset_id: 'test_adset_123',
-      adset_name: 'Test AdSet',
-      campaign_id: 'test_campaign_123',
-      campaign_name: campaignName,
-      form_id: 'test_form_123',
-      form_name: 'Test Form',
+    // Create test lead data
+    const testLeadData = {
+      full_name: req.body.full_name,
+      phone_number: req.body.phone_number,
+      email: req.body.email,
+      lead_id: req.body.lead_id,
+      campaign_id: req.body.campaign_id || 'test_campaign',
+      ad_id: req.body.ad_id || 'test_ad',
+      form_id: req.body.form_id || 'test_form',
+      created_time: Math.floor(Date.now() / 1000),
       field_data: [
-        { name: 'email', values: [email] },
-        { name: 'phone_number', values: [phone] },
-        { name: 'full_name', values: [name] }
+        { name: 'full_name', values: [req.body.full_name] },
+        { name: 'phone_number', values: [req.body.phone_number] },
+        { name: 'email', values: [req.body.email] }
       ]
     };
 
-    await processMetaLead(testMetaLead, {});
+    // Process the test lead
+    const result = await metaAdsService.processMetaLead(testLeadData);
 
-    res.json({ 
-      message: 'Test lead created successfully',
-      leadData: testMetaLead
+    res.json({
+      success: true,
+      message: 'Test webhook processed successfully',
+      result
     });
 
   } catch (error) {
-    console.error('Test lead creation error:', error);
-    res.status(500).json({ message: 'Error creating test lead' });
-  }
-});
-
-// @route   GET /api/meta/stats
-// @desc    Get Meta leads statistics
-// @access  Private
-router.get('/stats', verifyToken, async (req, res) => {
-  try {
-    const { startDate, endDate } = req.query;
-    
-    const filter = { source: { $in: ['facebook', 'instagram'] } };
-    
-    if (startDate && endDate) {
-      filter.createdAt = {
-        $gte: new Date(startDate),
-        $lte: new Date(endDate)
-      };
-    }
-
-    const stats = await Lead.aggregate([
-      { $match: filter },
-      {
-        $group: {
-          _id: {
-            source: '$source',
-            status: '$status'
-          },
-          count: { $sum: 1 },
-          avgScore: { $avg: '$score' }
-        }
-      },
-      {
-        $group: {
-          _id: '$_id.source',
-          statusBreakdown: {
-            $push: {
-              status: '$_id.status',
-              count: '$count',
-              avgScore: '$avgScore'
-            }
-          },
-          totalLeads: { $sum: '$count' }
-        }
-      }
-    ]);
-
-    res.json({ stats });
-
-  } catch (error) {
-    console.error('Meta stats error:', error);
-    res.status(500).json({ message: 'Error fetching Meta statistics' });
+    console.error('Test webhook error:', error);
+    res.status(500).json({ message: 'Server error' });
   }
 });
 
